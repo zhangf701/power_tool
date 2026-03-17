@@ -200,6 +200,28 @@ _TX3_RANGES = {
 
 
 @dataclass
+class ShortCircuitSummary:
+    fault_type: str
+    neutral_mode: str
+    U_kV: float
+    line_len_km: float
+    Z1_ohm: complex
+    Z2_ohm: complex
+    Z0_ohm: complex
+    Zn_ohm: complex
+    Rf_ohm: float
+    I0_A: complex
+    I1_A: complex
+    I2_A: complex
+    Ia_A: complex
+    Ib_A: complex
+    Ic_A: complex
+    I_break_kA: float
+    tau_dc_s: float
+    breaker_ok: Optional[bool]
+    notes: str
+
+@dataclass
 class ParamWarning:
     param: str
     value: float
@@ -837,6 +859,139 @@ def natural_power_and_reactive(U_kV_ll: float,
     )
 
 
+def _phase_currents_from_sequence(I0: complex, I1: complex, I2: complex) -> tuple[complex, complex, complex]:
+    a = complex(-0.5, math.sqrt(3.0) / 2.0)
+    a2 = complex(-0.5, -math.sqrt(3.0) / 2.0)
+    Ia = I0 + I1 + I2
+    Ib = I0 + a2 * I1 + a * I2
+    Ic = I0 + a * I1 + a2 * I2
+    return Ia, Ib, Ic
+
+
+def _zr_from_xr(z_mag: float, xr: float) -> tuple[float, float]:
+    xr = max(xr, 1e-6)
+    r = z_mag / math.sqrt(1.0 + xr * xr)
+    x = r * xr
+    return r, x
+
+
+def _neutral_impedance(mode: str, rn: float, xn: float) -> tuple[complex, str]:
+    key = mode.strip()
+    if key == "直接接地":
+        return 0j, key
+    if key == "中性点不接地":
+        return complex(1e9, 0.0), key
+    if key == "经消弧线圈接地":
+        _validate_nonnegative("消弧线圈电抗 Xn", xn)
+        return complex(0.0, xn), key
+    if key == "经电阻接地":
+        _validate_nonnegative("接地电阻 Rn", rn)
+        return complex(rn, 0.0), key
+    raise InputError("中性点方式不支持。可选：直接接地/中性点不接地/经消弧线圈接地/经电阻接地。")
+
+
+def short_circuit_capacity(U_kV_ll: float,
+                           fault_type: str,
+                           s_sc_mva: float,
+                           xr_sys: float,
+                           line_len_km: float,
+                           line_r1_ohm_km: float,
+                           line_x1_ohm_km: float,
+                           line_r0_ohm_km: float,
+                           line_x0_ohm_km: float,
+                           neutral_mode: str,
+                           neutral_rn_ohm: float,
+                           neutral_xn_ohm: float,
+                           Rf_ohm: float,
+                           breaker_IkA: Optional[float]) -> ShortCircuitSummary:
+    _validate_positive("U", U_kV_ll)
+    _validate_positive("系统短路容量 S_sc", s_sc_mva)
+    _validate_positive("系统 X/R", xr_sys)
+    _validate_nonnegative("线路长度", line_len_km)
+    _validate_nonnegative("过渡电阻 Rf", Rf_ohm)
+
+    zsys_mag = U_kV_ll * U_kV_ll / s_sc_mva
+    r_sys, x_sys = _zr_from_xr(zsys_mag, xr_sys)
+    Zsys1 = complex(r_sys, x_sys)
+    Zsys2 = complex(r_sys, x_sys)
+
+    Zl1 = complex(line_r1_ohm_km * line_len_km, line_x1_ohm_km * line_len_km)
+    Zl2 = Zl1
+    Zl0 = complex(line_r0_ohm_km * line_len_km, line_x0_ohm_km * line_len_km)
+
+    Z1 = Zsys1 + Zl1
+    Z2 = Zsys2 + Zl2
+    Zn, neutral_name = _neutral_impedance(neutral_mode, neutral_rn_ohm, neutral_xn_ohm)
+    Z0 = Zsys1 + Zl0
+    Zf = complex(Rf_ohm, 0.0)
+
+    E = U_kV_ll * 1e3 / math.sqrt(3.0)
+    ft = fault_type.strip()
+    if ft in {"三相短路", "三相接地", "ABC三相短路"}:
+        I1 = E / (Z1 + Zf); I2 = 0j; I0 = 0j
+        fault_name = "三相短路"; Z_eq = Z1 + Zf
+    elif ft in {"A相接地", "B相接地", "C相接地", "单相接地", "A-G", "B-G", "C-G"}:
+        denom = Z1 + Z2 + Z0 + 3.0 * (Zn + Zf)
+        Ieq = E / denom
+
+        if ft in {"A相接地", "单相接地", "A-G"}:
+            Ia, Ib, Ic = 3.0 * Ieq, 0j, 0j
+            fault_name = "A相接地"
+        elif ft in {"B相接地", "B-G"}:
+            Ia, Ib, Ic = 0j, 3.0 * Ieq, 0j
+            fault_name = "B相接地"
+        else:
+            Ia, Ib, Ic = 0j, 0j, 3.0 * Ieq
+            fault_name = "C相接地"
+
+        I0 = (Ia + Ib + Ic) / 3.0
+        a = complex(-0.5, math.sqrt(3.0) / 2.0)
+        a2 = complex(-0.5, -math.sqrt(3.0) / 2.0)
+        I1 = (Ia + a * Ib + a2 * Ic) / 3.0
+        I2 = (Ia + a2 * Ib + a * Ic) / 3.0
+        Z_eq = denom / 3.0
+    elif ft in {"AB两相短路", "BC两相短路", "CA两相短路", "两相短路"}:
+        denom = Z1 + Z2 + Zf
+        I1 = E / denom; I2 = -I1; I0 = 0j
+        fault_name = ft; Z_eq = denom / 2.0
+    elif ft in {"AB两相接地", "BC两相接地", "CA两相接地", "两相接地"}:
+        z0g = Z0 + 3.0 * (Zn + Zf)
+        zpar = (Z2 * z0g) / (Z2 + z0g)
+        I1 = E / (Z1 + zpar)
+        Vx = E - I1 * Z1
+        I2 = -Vx / Z2
+        I0 = -Vx / z0g
+        fault_name = ft; Z_eq = Z1 + zpar
+    else:
+        raise InputError("故障类型不支持。请使用中文故障类型（如A/B/C相接地、AB/BC/CA两相接地、AB/BC/CA两相短路、三相接地）。")
+
+    if ft not in {"A相接地", "B相接地", "C相接地", "单相接地", "A-G", "B-G", "C-G"}:
+        Ia, Ib, Ic = _phase_currents_from_sequence(I0, I1, I2)
+    i_break_kA = max(abs(Ia), abs(Ib), abs(Ic)) / 1e3
+
+    R_eq = max(Z_eq.real, 1e-6)
+    X_eq = abs(Z_eq.imag)
+    tau_dc = X_eq / (2.0 * math.pi * 50.0 * R_eq)
+
+    ok = None
+    if breaker_IkA is not None:
+        _validate_positive("断路器额定开断电流", breaker_IkA)
+        ok = breaker_IkA >= i_break_kA
+
+    notes = (
+        "默认模型：系统等值（由S_sc与X/R给定）与线路串联，故障点在线路末端。"
+        " 已计入中性点接地方式与过渡电阻；波形含交流分量+指数衰减直流偏置。"
+    )
+
+    return ShortCircuitSummary(
+        fault_type=fault_name, neutral_mode=neutral_name,
+        U_kV=U_kV_ll, line_len_km=line_len_km,
+        Z1_ohm=Z1, Z2_ohm=Z2, Z0_ohm=Z0, Zn_ohm=Zn, Rf_ohm=Rf_ohm,
+        I0_A=I0, I1_A=I1, I2_A=I2, Ia_A=Ia, Ib_A=Ib, Ic_A=Ic,
+        I_break_kA=i_break_kA, tau_dc_s=tau_dc, breaker_ok=ok, notes=notes,
+    )
+
+
 def impact_method(delta_p: float,
                   delta_t_s: float,
                   f_d_hz: float,
@@ -1141,6 +1296,7 @@ class ApproximationToolGUI(tk.Tk):
         self.line_tab = ttk.Frame(notebook)
         self.impact_tab = ttk.Frame(notebook)
         self.param_tab = ttk.Frame(notebook)
+        self.sc_tab = ttk.Frame(notebook)
 
         notebook.add(self.freq_tab, text="频率动态")
         notebook.add(self.osc_tab, text="机电振荡")
@@ -1148,6 +1304,7 @@ class ApproximationToolGUI(tk.Tk):
         notebook.add(self.line_tab, text="线路自然功率与无功")
         notebook.add(self.impact_tab, text="暂稳评估")
         notebook.add(self.param_tab, text="参数校核与标幺值")
+        notebook.add(self.sc_tab, text="短路电流计算")
 
         self._build_frequency_tab()
         self._build_oscillation_tab()
@@ -1155,6 +1312,7 @@ class ApproximationToolGUI(tk.Tk):
         self._build_line_tab()
         self._build_impact_tab()
         self._build_param_tab()
+        self._build_short_circuit_tab()
 
     @staticmethod
     def _add_entry(parent: ttk.Frame,
@@ -1728,6 +1886,206 @@ class ApproximationToolGUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("计算错误", str(exc))
 
+
+
+    def _build_short_circuit_tab(self) -> None:
+        self.sc_tab.columnconfigure(1, weight=1)
+        self.sc_tab.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(self.sc_tab, padding=10)
+        right = ttk.Frame(self.sc_tab, padding=10)
+        left.grid(row=0, column=0, sticky="nsw")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="短路电流计算（系统+线路串联，故障在线路末端）", font=("TkDefaultFont", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+
+        self.sc_fault_type = ttk.Combobox(left, state="readonly", width=18,
+                                          values=["A相接地", "B相接地", "C相接地", "AB两相接地", "BC两相接地", "CA两相接地", "AB两相短路", "BC两相短路", "CA两相短路", "三相接地"])
+        ttk.Label(left, text="故障类型").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.sc_fault_type.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        self.sc_fault_type.set("A相接地")
+
+        self.sc_u = self._add_entry(left, 2, "系统电压 U / kV（线电压）", "110")
+        self.sc_ssc = self._add_entry(left, 3, "系统短路容量 S_sc / MVA", "2000")
+        self.sc_xr = self._add_entry(left, 4, "系统 X/R 比", "10")
+        self.sc_len = self._add_entry(left, 5, "线路长度 / km", "30")
+        self.sc_r1 = self._add_entry(left, 6, "线路正序电阻 R1 / (Ω/km)", "0.05")
+        self.sc_x1 = self._add_entry(left, 7, "线路正序电抗 X1 / (Ω/km)", "0.40")
+        self.sc_r0 = self._add_entry(left, 8, "线路零序电阻 R0 / (Ω/km)", "0.15")
+        self.sc_x0 = self._add_entry(left, 9, "线路零序电抗 X0 / (Ω/km)", "1.20")
+        self.sc_rf = self._add_entry(left, 10, "过渡电阻 Rf / Ω", "0.0")
+
+        self.sc_neutral_mode = ttk.Combobox(left, state="readonly", width=18,
+                                            values=["直接接地", "中性点不接地", "经消弧线圈接地", "经电阻接地"])
+        ttk.Label(left, text="系统中性点方式").grid(row=11, column=0, sticky="w", padx=4, pady=4)
+        self.sc_neutral_mode.grid(row=11, column=1, sticky="ew", padx=4, pady=4)
+        self.sc_neutral_mode.set("直接接地")
+
+        self.sc_rn = self._add_entry(left, 12, "中性点电阻 Rn / Ω", "1.5")
+        self.sc_xn = self._add_entry(left, 13, "中性点电抗 Xn / Ω（消弧线圈）", "12.0")
+
+        self.sc_neutral_mode.bind("<<ComboboxSelected>>", self._on_sc_neutral_mode_change)
+        self.sc_len.bind("<FocusOut>", self._on_sc_neutral_mode_change)
+        self.sc_r0.bind("<FocusOut>", self._on_sc_neutral_mode_change)
+        self.sc_x0.bind("<FocusOut>", self._on_sc_neutral_mode_change)
+        self._on_sc_neutral_mode_change()
+        self.sc_brk = self._add_entry(left, 14, "断路器额定开断电流 Ik / kA（可留空）", "31.5")
+        self.sc_cycles = self._add_entry(left, 15, "仿真周波数（波形）", "10")
+
+        ttk.Button(left, text="计算并绘图", command=self.calculate_short_circuit).grid(
+            row=16, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 4)
+        )
+
+        self.sc_result = ScrolledText(left, width=58, height=20, wrap=tk.WORD)
+        self.sc_result.grid(row=17, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+        self.sc_result.configure(state="disabled")
+
+        ttk.Label(right, text="短路点电流波形", font=("TkDefaultFont", 11, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+
+        self.sc_fig = Figure(figsize=(8.4, 5.4), dpi=100)
+        self.sc_ax_phase = self.sc_fig.add_subplot(211)
+        self.sc_ax_seq = self.sc_fig.add_subplot(212)
+        self.sc_ax_phase.set_ylabel("i_abc / A")
+        self.sc_ax_seq.set_ylabel("i_012 / A")
+        self.sc_ax_seq.set_xlabel("t / s")
+        self.sc_ax_phase.grid(True, alpha=0.4)
+        self.sc_ax_seq.grid(True, alpha=0.4)
+
+        self.sc_canvas = FigureCanvasTkAgg(self.sc_fig, master=right)
+        self.sc_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        self.sc_toolbar = NavigationToolbar2Tk(self.sc_canvas, right, pack_toolbar=False)
+        self.sc_toolbar.update()
+        self.sc_toolbar.grid(row=2, column=0, sticky="ew")
+
+        self.calculate_short_circuit()
+
+    def _on_sc_neutral_mode_change(self, _event: object | None = None) -> None:
+        """根据线路零序参数给出与量级匹配的中性点参数默认值。"""
+        try:
+            length = _safe_float(self.sc_len.get(), "线路长度")
+            r0 = _safe_float(self.sc_r0.get(), "R0")
+            x0 = _safe_float(self.sc_x0.get(), "X0")
+            r0_total = max(0.0, r0 * length)
+            x0_total = max(0.0, x0 * length)
+        except Exception:
+            r0_total, x0_total = 4.5, 36.0
+
+        mode = self.sc_neutral_mode.get().strip()
+        if mode == "直接接地":
+            rn, xn = 0.0, 0.0
+        elif mode == "中性点不接地":
+            rn, xn = 1e9, 0.0
+        elif mode == "经消弧线圈接地":
+            rn, xn = 0.0, x0_total / 3.0
+        elif mode == "经电阻接地":
+            rn, xn = r0_total / 3.0, 0.0
+        else:
+            rn, xn = 0.0, 0.0
+
+        self.sc_rn.delete(0, tk.END)
+        self.sc_rn.insert(0, f"{rn:.6g}")
+        self.sc_xn.delete(0, tk.END)
+        self.sc_xn.insert(0, f"{xn:.6g}")
+
+    def calculate_short_circuit(self) -> None:
+        try:
+            fault_type = self.sc_fault_type.get().strip()
+            neutral_mode = self.sc_neutral_mode.get().strip()
+            U = _safe_float(self.sc_u.get(), "U")
+            Ssc = _safe_float(self.sc_ssc.get(), "S_sc")
+            xr = _safe_float(self.sc_xr.get(), "X/R")
+            length = _safe_float(self.sc_len.get(), "线路长度")
+            R1 = _safe_float(self.sc_r1.get(), "R1")
+            X1 = _safe_float(self.sc_x1.get(), "X1")
+            R0 = _safe_float(self.sc_r0.get(), "R0")
+            X0 = _safe_float(self.sc_x0.get(), "X0")
+            Rf = _safe_float(self.sc_rf.get(), "Rf")
+            Rn = _safe_float(self.sc_rn.get(), "Rn")
+            Xn = _safe_float(self.sc_xn.get(), "Xn")
+            cycles = max(1.0, _safe_float(self.sc_cycles.get(), "仿真周波数"))
+            brk_txt = self.sc_brk.get().strip()
+            brk = _safe_float(brk_txt, "Ik") if brk_txt else None
+
+            r = short_circuit_capacity(U, fault_type, Ssc, xr, length, R1, X1, R0, X0,
+                                       neutral_mode, Rn, Xn, Rf, brk)
+
+            def _pa(z: complex) -> str:
+                return f"{abs(z):.2f}∠{math.degrees(math.atan2(z.imag, z.real)):.1f}°"
+
+            if r.breaker_ok is None:
+                check = "未输入断路器开断电流，未做匹配判断。"
+            else:
+                check = "匹配：额定开断电流 ≥ 计算开断电流。" if r.breaker_ok else "不匹配：额定开断电流 < 计算开断电流。"
+
+            text = (
+                f"══ 复合序网计算结果 ═════════════════════════════\n"
+                f"  故障类型：{r.fault_type}，中性点：{r.neutral_mode}\n"
+                f"  U = {r.U_kV:.4g} kV，线路长度 = {r.line_len_km:.4g} km，Rf = {r.Rf_ohm:.4g} Ω\n"
+                f"  Z1 = {r.Z1_ohm.real:.4f}+j{r.Z1_ohm.imag:.4f} Ω\n"
+                f"  Z2 = {r.Z2_ohm.real:.4f}+j{r.Z2_ohm.imag:.4f} Ω\n"
+                f"  Z0 = {r.Z0_ohm.real:.4f}+j{r.Z0_ohm.imag:.4f} Ω\n"
+                f"  Zn = {r.Zn_ohm.real:.4f}+j{r.Zn_ohm.imag:.4f} Ω\n"
+                f"  I1 = {_pa(r.I1_A)} A\n"
+                f"  I2 = {_pa(r.I2_A)} A\n"
+                f"  I0 = {_pa(r.I0_A)} A\n"
+                f"  Ia = {_pa(r.Ia_A)} A\n"
+                f"  Ib = {_pa(r.Ib_A)} A\n"
+                f"  Ic = {_pa(r.Ic_A)} A\n"
+                f"  开断校核电流 Ibreak = {r.I_break_kA:.4f} kA\n"
+                f"  直流偏置时间常数 τ = {r.tau_dc_s:.6f} s\n"
+                f"\n══ 断路器匹配 ═════════════════════════════════════\n"
+                f"  {check}\n"
+                f"\n说明：{r.notes}"
+            )
+            self._set_text(self.sc_result, text)
+
+            f = 50.0
+            w = 2.0 * math.pi * f
+            t_end = cycles / f
+            t = np.linspace(0.0, t_end, int(2400 * cycles / 3.0) + 1)
+
+            def iwave(I: complex) -> np.ndarray:
+                amp = math.sqrt(2.0) * abs(I)
+                phi = math.atan2(I.imag, I.real)
+                iac = amp * np.sin(w * t + phi)
+                idc = -amp * math.sin(phi) * np.exp(-t / max(r.tau_dc_s, 1e-4))
+                return iac + idc
+
+            ia = iwave(r.Ia_A)
+            ib = iwave(r.Ib_A)
+            ic = iwave(r.Ic_A)
+            i1 = iwave(r.I1_A)
+            i2 = iwave(r.I2_A)
+            i0 = iwave(r.I0_A)
+
+            self.sc_ax_phase.clear()
+            self.sc_ax_seq.clear()
+            self.sc_ax_phase.plot(t, ia, label="iA", lw=1.2)
+            self.sc_ax_phase.plot(t, ib, label="iB", lw=1.2)
+            self.sc_ax_phase.plot(t, ic, label="iC", lw=1.2)
+            self.sc_ax_phase.set_ylabel("i_abc / A")
+            self.sc_ax_phase.grid(True, alpha=0.35)
+            self.sc_ax_phase.legend(loc="upper right", ncol=3, fontsize=8)
+
+            self.sc_ax_seq.plot(t, i1, label="i1(正序)", lw=1.2)
+            self.sc_ax_seq.plot(t, i2, label="i2(负序)", lw=1.2)
+            self.sc_ax_seq.plot(t, i0, label="i0(零序)", lw=1.2)
+            self.sc_ax_seq.set_ylabel("i_012 / A")
+            self.sc_ax_seq.set_xlabel("t / s")
+            self.sc_ax_seq.grid(True, alpha=0.35)
+            self.sc_ax_seq.legend(loc="upper right", ncol=3, fontsize=8)
+
+            self.sc_fig.tight_layout()
+            self.sc_canvas.draw()
+
+        except Exception as exc:
+            messagebox.showerror("计算错误", str(exc))
 
     # ════════════════════════════════════════════════════════════════════
     # 参数校核与标幺值转换标签页
