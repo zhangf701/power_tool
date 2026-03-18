@@ -1,7 +1,47 @@
 {
   "sheet": "有名值",
-  "description": "按电压等级整理的典型架空线路参数",
+  "description": "按电压等级整理的典型架空线路参数（含新增 750kV / 1000kV 文献典型值）",
   "sections": [
+    {
+      "section_title": "1000kV单回线路（文献典型值）",
+      "voltage_level_kv": 1000,
+      "line_type": "单回",
+      "source_note": "文献给出单位长度 R/L/C 参数；X 由 X=2π·50·L 换算。适合作为 1000 kV 交流特高压线路工程典型值。",
+      "entries": [
+        {
+          "calc_no": 1000001,
+          "layout": "文献典型",
+          "conductor_model": "1000kV UHV 架空线路",
+          "ground_wire_model": null,
+          "R1_ohm_per_km": 0.00758,
+          "X1_ohm_per_km": 0.263649,
+          "C1_uF_per_km": 0.01397,
+          "R0_ohm_per_km": 0.15421,
+          "X0_ohm_per_km": 0.830606,
+          "C0_uF_per_km": 0.009296
+        }
+      ]
+    },
+    {
+      "section_title": "750kV单回线路（文献典型值）",
+      "voltage_level_kv": 750,
+      "line_type": "单回",
+      "source_note": "文献给出单位长度 R/L/C 参数；X 由 X=2π·50·L 换算。适合作为 750 kV 交流超高压线路工程典型值。",
+      "entries": [
+        {
+          "calc_no": 750001,
+          "layout": "文献典型",
+          "conductor_model": "750kV 架空线路",
+          "ground_wire_model": null,
+          "R1_ohm_per_km": 0.013,
+          "X1_ohm_per_km": 0.276774,
+          "C1_uF_per_km": 0.0131,
+          "R0_ohm_per_km": 0.267,
+          "X0_ohm_per_km": 1.096416,
+          "C0_uF_per_km": 0.0087
+        }
+      ]
+    },
     {
       "section_title": "500kV单回线路",
       "voltage_level_kv": 500,
@@ -759,5 +799,9 @@
         }
       ]
     }
-  ]
+  ],
+  "source_notes": {
+    "750kV": "单位长度参数取自 750 kV 交流线路文献典型值，X 由工频 50 Hz 下的电感换算得到。",
+    "1000kV": "单位长度参数取自 1000 kV 特高压交流线路文献典型值，X 由工频 50 Hz 下的电感换算得到。"
+  }
 }
