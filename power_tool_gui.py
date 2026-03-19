@@ -1976,7 +1976,7 @@ class ApproximationToolGUI(tk.Tk):
         tools = ttk.Frame(basic)
         tools.grid(row=8, column=0, columnspan=4, sticky="ew", padx=4, pady=(6, 2))
         ttk.Button(tools, text="按 N 重建表格", command=self._rebuild_loop_closure_rows).pack(side="left", padx=(0, 6))
-        ttk.Button(tools, text="加载附录 B 默认值", command=self._apply_loop_closure_appendix_defaults).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="加载默认值", command=self._apply_loop_closure_appendix_defaults).pack(side="left", padx=(0, 6))
         ttk.Button(tools, text="计算并绘图", command=self.calculate_loop_closure).pack(side="left")
 
         hint = (
