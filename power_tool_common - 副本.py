@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 
-import sys
 
 import math
 
@@ -26,29 +25,15 @@ import numpy as np
 EPS = 1e-10
 
 def load_line_params_reference() -> dict:
-    """读取架空线路典型参数 JSON 数据（兼容 PyInstaller 打包）。"""
-    
-    # 1. 核心逻辑：判断是否处于 PyInstaller 打包后的运行环境
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        # 打包后的路径
-        base_path = Path(sys._MEIPASS)
-    else:
-        # 普通运行时的路径
-        base_path = Path(__file__).resolve().parent
-
-    data_path = base_path / "line_params_reference.json"
-
-    # 2. 以下逻辑保持不变
+    """读取架空线路典型参数 JSON 数据。"""
+    data_path = Path(__file__).resolve().with_name("line_params_reference.json")
     if not data_path.exists():
-        raise FileNotFoundError(f"未找到典型参数文件：{data_path}")
-        
+        raise FileNotFoundError(f"未找到典型参数文件：{data_path.name}")
     with data_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
-        
     sections = data.get("sections")
     if not isinstance(sections, list):
         raise ValueError("典型参数 JSON 格式错误：缺少 sections 列表。")
-        
     return data
 
 class InputError(ValueError):
