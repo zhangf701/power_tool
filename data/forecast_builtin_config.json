@@ -1,0 +1,309 @@
+{
+  "schema_version": "2026.06",
+  "defaults": {
+    "algorithm": "adaptive_ensemble",
+    "interval_minutes": 60,
+    "horizon_hours": 24,
+    "ensemble_candidates": [
+      "ridge",
+      "huber",
+      "hourly_analog",
+      "exp_smoothing",
+      "seasonal_naive"
+    ],
+    "validation_min_points": 24,
+    "validation_fraction": 0.2,
+    "confidence_quantile": 0.8,
+    "default_latitude": 32.0603,
+    "default_longitude": 118.7969,
+    "default_altitude_m": 20.0,
+    "default_holiday_country": "CN",
+    "weather_condition": "clear",
+    "cloud_cover_pct": 0.0,
+    "irradiance_adjustment": 1.0,
+    "pv_tilt_deg": 30.0,
+    "pv_azimuth_deg": 180.0,
+    "pv_albedo": 0.2,
+    "pv_temp_coeff_pct_per_c": -0.35,
+    "pv_noct_c": 45.0
+  },
+  "algorithm_catalog": [
+    {
+      "code": "adaptive_ensemble",
+      "label": "自适应综合方案",
+      "description": "对候选算法做留出校验，按误差反比自动分配权重，输出综合曲线。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 10
+    },
+    {
+      "code": "ridge",
+      "label": "岭回归",
+      "description": "线性可解释模型，包含小时、星期、节假日、季节、气象和地理特征。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 20
+    },
+    {
+      "code": "huber",
+      "label": "Huber鲁棒回归",
+      "description": "对坏点、尖峰点更稳健；安装 scikit-learn 时调用 HuberRegressor，否则使用两阶段加权岭回归。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 30
+    },
+    {
+      "code": "hourly_analog",
+      "label": "相似日同刻法",
+      "description": "按同小时、日型、节假日和气象相似度选取历史样本，适合调度员经验校核和节假日对比。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 40
+    },
+    {
+      "code": "exp_smoothing",
+      "label": "同刻指数平滑",
+      "description": "按同一时刻历史值进行递近加权，偏重近期走势，可作为负荷还原修正后的快速基准。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 50
+    },
+    {
+      "code": "seasonal_naive",
+      "label": "周周期基准",
+      "description": "优先取上一周同刻值，缺失时退化为前一日或同刻中位数。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [],
+      "priority": 60
+    },
+    {
+      "code": "random_forest",
+      "label": "随机森林",
+      "description": "安装 scikit-learn 时启用的非线性树模型，适合气象非线性较强场景。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [
+        "sklearn"
+      ],
+      "priority": 70
+    },
+    {
+      "code": "gradient_boosting",
+      "label": "梯度提升树",
+      "description": "安装 scikit-learn 时启用的提升树模型，适合小样本非线性拟合对比。",
+      "supports": [
+        "load",
+        "renewable"
+      ],
+      "requires": [
+        "sklearn"
+      ],
+      "priority": 80
+    }
+  ],
+  "regions": [
+    {
+      "name": "南京默认光伏站点",
+      "kind": "renewable",
+      "resource": "solar",
+      "latitude": 32.0603,
+      "longitude": 118.7969,
+      "altitude_m": 20.0,
+      "holiday_country": "CN",
+      "pv_tilt_deg": 30,
+      "pv_azimuth_deg": 180,
+      "notes": "默认新能源预测地理配置；方位角 180° 表示朝南，适合中国华东固定式光伏组件演示。"
+    },
+    {
+      "name": "南京默认负荷站点",
+      "kind": "load",
+      "latitude": 32.0603,
+      "longitude": 118.7969,
+      "altitude_m": 20.0,
+      "holiday_country": "CN",
+      "notes": "默认负荷预测地理配置。"
+    },
+    {
+      "name": "华东负荷示例",
+      "kind": "load",
+      "latitude": 31.23,
+      "longitude": 121.47,
+      "altitude_m": 10,
+      "holiday_country": "CN",
+      "notes": "适合电工杯风格负荷样例的默认地理配置。"
+    },
+    {
+      "name": "华南负荷示例",
+      "kind": "load",
+      "latitude": 23.13,
+      "longitude": 113.26,
+      "altitude_m": 20,
+      "holiday_country": "CN",
+      "notes": "适合南网中文字段负荷样例的默认地理配置。"
+    },
+    {
+      "name": "西北光伏基地示例",
+      "kind": "renewable",
+      "resource": "solar",
+      "latitude": 38.5,
+      "longitude": 101.0,
+      "altitude_m": 1450,
+      "holiday_country": "CN",
+      "notes": "高海拔/强辐照光伏基地演示配置。"
+    },
+    {
+      "name": "冀北风电基地示例",
+      "kind": "renewable",
+      "resource": "wind",
+      "latitude": 41.0,
+      "longitude": 115.0,
+      "altitude_m": 900,
+      "holiday_country": "CN",
+      "notes": "Baidu KDD/SDWPF 风电样例的地理配置。"
+    }
+  ],
+  "schema_alias_groups": {
+    "time": [
+      "timestamp",
+      "time",
+      "datetime",
+      "date_time",
+      "日期",
+      "时刻",
+      "hour",
+      "Tmstamp"
+    ],
+    "load": [
+      "load_mw",
+      "demand_mw",
+      "统调负荷",
+      "系统负荷",
+      "负荷"
+    ],
+    "renewable": [
+      "solar_mw",
+      "wind_mw",
+      "renewable_mw",
+      "光伏出力",
+      "风电出力",
+      "Patv"
+    ],
+    "weather": [
+      "temperature_c",
+      "气温",
+      "ghi_wm2",
+      "辐照度",
+      "wind_speed_mps",
+      "Wspd"
+    ]
+  },
+  "special_events": [
+    {
+      "name": "高温错峰/需求侧响应示例",
+      "region": "*",
+      "kind": "load",
+      "enabled": false,
+      "start": "2025-06-22 13:00",
+      "end": "2025-06-22 18:00",
+      "ramp_hours": 1.0,
+      "lag_hours": 0.0,
+      "adjustment_mw": -300.0,
+      "relative_adjustment": 0.0,
+      "description": "默认关闭。启用后用于演示特殊事件对预测结果的绝对 MW 修正。"
+    },
+    {
+      "name": "大风限电/弃风风险示例",
+      "region": "*",
+      "kind": "renewable",
+      "resource": "wind",
+      "enabled": false,
+      "start": "2025-06-22 00:00",
+      "end": "2025-06-22 06:00",
+      "ramp_hours": 0.5,
+      "lag_hours": 0.0,
+      "adjustment_mw": 0.0,
+      "relative_adjustment": -0.08,
+      "description": "默认关闭。启用后用于演示新能源外部约束对风电预测的比例修正。"
+    },
+    {
+      "name": "云团遮挡/光伏快速下降示例",
+      "region": "*",
+      "kind": "renewable",
+      "resource": "solar",
+      "enabled": false,
+      "start": "2025-06-22 11:30",
+      "end": "2025-06-22 14:30",
+      "ramp_hours": 0.5,
+      "lag_hours": 0.0,
+      "adjustment_mw": 0.0,
+      "relative_adjustment": -0.12,
+      "description": "默认关闭。启用后用于演示云团事件导致的光伏出力比例修正。"
+    }
+  ],
+  "weather_scenarios": [
+    {
+      "code": "clear",
+      "label": "晴空",
+      "irradiance_factor_base": 1.0,
+      "description": "无云或极少云。"
+    },
+    {
+      "code": "partly_cloudy",
+      "label": "少云",
+      "irradiance_factor_base": 0.82,
+      "description": "云量较低，光伏出力轻度下降。"
+    },
+    {
+      "code": "cloudy",
+      "label": "多云",
+      "irradiance_factor_base": 0.58,
+      "description": "云量较高，散射分量占比上升。"
+    },
+    {
+      "code": "overcast",
+      "label": "阴天",
+      "irradiance_factor_base": 0.3,
+      "description": "厚云覆盖，直射分量显著下降。"
+    },
+    {
+      "code": "rain_snow",
+      "label": "雨雪",
+      "irradiance_factor_base": 0.16,
+      "description": "雨雪天气，辐照度显著降低。"
+    },
+    {
+      "code": "haze",
+      "label": "雾霾",
+      "irradiance_factor_base": 0.68,
+      "description": "气溶胶/能见度较差，直射分量衰减。"
+    }
+  ],
+  "pv_geometry_defaults": {
+    "azimuth_convention": "0°=北，90°=东，180°=南，270°=西",
+    "tilt_deg": 30.0,
+    "azimuth_deg": 180.0,
+    "albedo": 0.2,
+    "temperature_coefficient_pct_per_c": -0.35,
+    "noct_c": 45.0
+  }
+}

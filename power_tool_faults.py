@@ -151,41 +151,58 @@ def short_circuit_capacity(U_kV_ll: float,
     if mode == "单电源":
         E = E_left
     ft = fault_type.strip()
+    a = complex(-0.5, math.sqrt(3.0) / 2.0)
+    a2 = complex(-0.5, -math.sqrt(3.0) / 2.0)
     if ft in {"三相短路", "三相接地", "ABC三相短路"}:
         I1 = E / (Z1 + Zf); I2 = 0j; I0 = 0j
         fault_name = "三相短路"; Z_eq = Z1 + Zf
     elif ft in {"A相接地", "B相接地", "C相接地", "单相接地", "A-G", "B-G", "C-G"}:
+        # Single-line-to-ground faults on B/C require the phase-shifted
+        # sequence source.  Using the A-phase current directly gives the right
+        # magnitude but violates the boundary condition V_faulted = 3*Rf*I_phase.
         denom = Z1 + Z2 + Z0 + 3.0 * Zf
-        Ieq = E / denom
-
         if ft in {"A相接地", "单相接地", "A-G"}:
-            Ia, Ib, Ic = 3.0 * Ieq, 0j, 0j
-            fault_name = "A相接地"
+            fault_phase = "A"; phase_factor = 1.0 + 0.0j; fault_name = "A相接地"
         elif ft in {"B相接地", "B-G"}:
-            Ia, Ib, Ic = 0j, 3.0 * Ieq, 0j
-            fault_name = "B相接地"
+            fault_phase = "B"; phase_factor = a2; fault_name = "B相接地"
         else:
-            Ia, Ib, Ic = 0j, 0j, 3.0 * Ieq
-            fault_name = "C相接地"
-
+            fault_phase = "C"; phase_factor = a; fault_name = "C相接地"
+        If = phase_factor * E / denom
+        Ia, Ib, Ic = (3.0 * If, 0j, 0j) if fault_phase == "A" else ((0j, 3.0 * If, 0j) if fault_phase == "B" else (0j, 0j, 3.0 * If))
         I0 = (Ia + Ib + Ic) / 3.0
-        a = complex(-0.5, math.sqrt(3.0) / 2.0)
-        a2 = complex(-0.5, -math.sqrt(3.0) / 2.0)
         I1 = (Ia + a * Ib + a2 * Ic) / 3.0
         I2 = (Ia + a2 * Ib + a * Ic) / 3.0
         Z_eq = denom / 3.0
     elif ft in {"AB两相短路", "BC两相短路", "CA两相短路", "两相短路"}:
+        # The basic I2=-I1 relation corresponds to a BC fault.  AB/CA faults
+        # must rotate the negative-sequence current, otherwise the displayed
+        # faulted phases are mislabeled.
         denom = Z1 + Z2 + Zf
-        I1 = E / denom; I2 = -I1; I0 = 0j
-        fault_name = ft; Z_eq = denom / 2.0
+        I1 = E / denom
+        if ft in {"BC两相短路", "两相短路"}:
+            I2 = -I1; fault_name = "BC两相短路"
+        elif ft == "CA两相短路":
+            I2 = -a * I1; fault_name = "CA两相短路"
+        else:
+            I2 = -a2 * I1; fault_name = "AB两相短路"
+        I0 = 0j
+        Z_eq = denom / 2.0
     elif ft in {"AB两相接地", "BC两相接地", "CA两相接地", "两相接地"}:
+        # The network reduction gives the BC-ground case.  AB-ground and
+        # CA-ground are obtained by rotating V0 and V2 relative to V1.
         z0g = Z0 + 3.0 * Zf
         zpar = (Z2 * z0g) / (Z2 + z0g)
         I1 = E / (Z1 + zpar)
         Vx = E - I1 * Z1
-        I2 = -Vx / Z2
-        I0 = -Vx / z0g
-        fault_name = ft; Z_eq = Z1 + zpar
+        if ft in {"BC两相接地", "两相接地"}:
+            f0 = 1.0 + 0.0j; f2 = 1.0 + 0.0j; fault_name = "BC两相接地"
+        elif ft == "CA两相接地":
+            f0 = a2; f2 = a; fault_name = "CA两相接地"
+        else:
+            f0 = a; f2 = a2; fault_name = "AB两相接地"
+        I2 = -f2 * Vx / Z2
+        I0 = -f0 * Vx / z0g
+        Z_eq = Z1 + zpar
     else:
         raise InputError("故障类型不支持。请使用中文故障类型（如A/B/C相接地、AB/BC/CA两相接地、AB/BC/CA两相短路、三相接地）。")
 
@@ -218,7 +235,10 @@ def short_circuit_capacity(U_kV_ll: float,
     ok = None
     if breaker_IkA is not None:
         _validate_positive("断路器额定开断电流", breaker_IkA)
-        ok = breaker_IkA >= i_break_kA
+        # In two-source studies each terminal breaker interrupts its own
+        # contribution, while the fault point current is the vector sum.  Use a
+        # conservative maximum so the status flag does not understate duty.
+        ok = breaker_IkA >= max(i_break_kA, i_break_left_kA, i_break_right_kA)
 
     notes = (
         f"当前模型：{mode_name}。"

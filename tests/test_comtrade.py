@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import struct
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from power_tool_comtrade import (
     parse_comtrade,
     parse_mat_waveform,
     parse_waveform_file,
+    sequence_components,
     sequence_phasors,
     single_frequency_phasor,
 )
@@ -290,3 +292,18 @@ def test_sequence_phasors_detects_positive_sequence() -> None:
     assert abs(seq.positive) > 1.0
     assert abs(seq.negative) < 1e-6
     assert abs(seq.zero) < 1e-6
+
+
+def test_sequence_components_uses_phasors_not_rms_magnitudes() -> None:
+    fs = 1000.0
+    f = 50.0
+    t = np.arange(0.0, 0.2, 1.0 / fs)
+    va = math.sqrt(2.0) * 100.0 * np.sin(2.0 * math.pi * f * t)
+    vb = math.sqrt(2.0) * 100.0 * np.sin(2.0 * math.pi * f * t - 2.0 * math.pi / 3.0)
+    vc = math.sqrt(2.0) * 100.0 * np.sin(2.0 * math.pi * f * t + 2.0 * math.pi / 3.0)
+
+    seq = sequence_components(va, vb, vc, sample_rate_hz=fs, fundamental_hz=f)
+
+    assert seq.positive == pytest.approx(100.0, rel=1e-3)
+    assert seq.negative == pytest.approx(0.0, abs=1e-6)
+    assert seq.zero == pytest.approx(0.0, abs=1e-6)

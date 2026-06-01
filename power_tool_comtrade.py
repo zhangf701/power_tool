@@ -885,16 +885,61 @@ def fourier_summary(signal: np.ndarray, sample_rate_hz: float, fundamental_hz: f
     return FourierSummary(fundamental_hz=fundamental_hz, dc=dc, harmonics=harmonics, thd_percent=thd)
 
 
-def sequence_components(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> SequenceSummary:
-    va = float(np.sqrt(np.mean(np.asarray(a, dtype=float) ** 2)))
-    vb = float(np.sqrt(np.mean(np.asarray(b, dtype=float) ** 2)))
-    vc = float(np.sqrt(np.mean(np.asarray(c, dtype=float) ** 2)))
-    alpha = complex(-0.5, math.sqrt(3.0) / 2.0)
-    v0 = (va + vb + vc) / 3.0
-    v1 = abs((va + alpha * vb + (alpha ** 2) * vc) / 3.0)
-    v2 = abs((va + (alpha ** 2) * vb + alpha * vc) / 3.0)
-    unbalance = (v2 / v1 * 100.0) if v1 > 1e-12 else 0.0
-    return SequenceSummary(positive=v1, negative=v2, zero=abs(v0), unbalance_percent=unbalance)
+def sequence_components(
+    a: np.ndarray,
+    b: np.ndarray,
+    c: np.ndarray,
+    sample_rate_hz: float | None = None,
+    fundamental_hz: float = 50.0,
+) -> SequenceSummary:
+    """Estimate sequence components from three phase waveforms.
+
+    Earlier versions used only per-phase RMS magnitudes, which is not a
+    sequence-component calculation: a balanced three-phase set then collapses
+    into a false zero-sequence value because the phase-angle information is
+    discarded.  This implementation extracts fundamental phasors first and
+    then applies the symmetrical-component transform.  The old three-argument
+    call remains accepted; in that mode a dominant FFT bin is used to retain
+    the phase relationship as well as possible.
+    """
+    va = np.asarray(a, dtype=float).reshape(-1)
+    vb = np.asarray(b, dtype=float).reshape(-1)
+    vc = np.asarray(c, dtype=float).reshape(-1)
+    n = min(va.size, vb.size, vc.size)
+    if n < 4:
+        raise ValueError('采样点不足，无法计算序分量。')
+    va = va[:n]
+    vb = vb[:n]
+    vc = vc[:n]
+
+    if sample_rate_hz is not None and sample_rate_hz > 0.0 and fundamental_hz > 0.0:
+        center = n // 2
+        cycles = max(1.0, min(5.0, n * fundamental_hz / sample_rate_hz))
+        pha = single_frequency_phasor(va, sample_rate_hz, fundamental_hz, center, cycles=cycles)
+        phb = single_frequency_phasor(vb, sample_rate_hz, fundamental_hz, center, cycles=cycles)
+        phc = single_frequency_phasor(vc, sample_rate_hz, fundamental_hz, center, cycles=cycles)
+    else:
+        # Backward-compatible fallback: infer the strongest non-DC bin from the
+        # three waveforms and retain the complex FFT phase.  Frequency units are
+        # normalized because the caller did not provide a sampling rate.
+        xa = va - float(np.mean(va))
+        xb = vb - float(np.mean(vb))
+        xc = vc - float(np.mean(vc))
+        spec = np.abs(np.fft.rfft(xa)) + np.abs(np.fft.rfft(xb)) + np.abs(np.fft.rfft(xc))
+        if spec.size < 2:
+            raise ValueError('频谱分辨率不足，无法计算序分量。')
+        k = int(np.argmax(spec[1:]) + 1)
+        basis = np.exp(-1j * 2.0 * np.pi * k * np.arange(n, dtype=float) / n)
+        pha = (2.0 / n) * np.dot(xa, basis) / math.sqrt(2.0)
+        phb = (2.0 / n) * np.dot(xb, basis) / math.sqrt(2.0)
+        phc = (2.0 / n) * np.dot(xc, basis) / math.sqrt(2.0)
+
+    seq = sequence_phasors(pha, phb, phc)
+    positive = abs(seq.positive)
+    negative = abs(seq.negative)
+    zero = abs(seq.zero)
+    unbalance = (negative / positive * 100.0) if positive > 1e-12 else 0.0
+    return SequenceSummary(positive=positive, negative=negative, zero=zero, unbalance_percent=unbalance)
 
 
 def prony_like_summary(signal: np.ndarray, sample_rate_hz: float) -> PronySummary:

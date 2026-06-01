@@ -32,6 +32,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 
 from matplotlib.lines import Line2D
 from matplotlib.figure import Figure
+from matplotlib.offsetbox import AnnotationBbox, DrawingArea, HPacker, TextArea, VPacker
 from matplotlib.patches import Circle, Rectangle
 
 
@@ -81,6 +82,27 @@ from power_tool_comtrade import (
     sequence_components,
     sequence_phasors,
     single_frequency_phasor,
+)
+from power_tool_forecast import (
+    ForecastConfig,
+    builtin_dataset_info,
+    export_forecast_result_csv,
+    export_forecast_result_json,
+    forecast_algorithm_label,
+    forecast_day_ahead,
+    format_forecast_summary,
+    classify_climate_block,
+    list_builtin_datasets,
+    list_forecast_algorithms,
+    load_builtin_forecast_dataset,
+    load_forecast_csv,
+    solar_day_profile,
+    solar_irradiance_on_panel,
+    solar_position,
+    solar_timezone_offset_hours,
+    NANJING_ALTITUDE_M,
+    NANJING_LATITUDE,
+    NANJING_LONGITUDE,
 )
 
 from power_tool_i18n import (
@@ -208,6 +230,8 @@ _MANUAL_LIBRARY: tuple[dict[str, str], ...] = (
     {"title_zh": "参数校核与标幺值：两绕组变压器", "title_en": "Parameter Validation & Per-Unit: Two-Winding Transformer", "basename": "PowerTool_Parameter_Validation_Two_Winding_Transformer"},
     {"title_zh": "参数校核与标幺值：三绕组变压器", "title_en": "Parameter Validation & Per-Unit: Three-Winding Transformer", "basename": "PowerTool_Parameter_Validation_Three_Winding_Transformer"},
     {"title_zh": "短路电流计算", "title_en": "Short-Circuit Current Calculation", "basename": "PowerTool_Short_Circuit_Current_Calculation"},
+    {"title_zh": "负荷预测", "title_en": "Load Forecasting", "basename": "PowerTool_Load_Forecasting"},
+    {"title_zh": "新能源预测", "title_en": "Renewable Forecasting", "basename": "PowerTool_Renewable_Forecasting"},
     {"title_zh": "录波曲线", "title_en": "Waveform Viewer", "basename": "PowerTool_Waveform_Viewer"},
 )
 
@@ -223,6 +247,36 @@ def _format_polar_complex(z: complex, unit: str = "") -> str:
     ang = math.degrees(math.atan2(z.imag, z.real))
     suffix = f" {unit}" if unit else ""
     return f"{mag:.2f} ∠ {ang:+.2f}°{suffix}"
+
+
+def _format_utc_offset(hours: int) -> str:
+    sign = "+" if hours >= 0 else "-"
+    return f"UTC{sign}{abs(hours):02d}:00"
+
+
+def _format_clock(dt: datetime | None) -> str:
+    return "--" if dt is None else f"{dt:%H:%M}"
+
+
+def _format_decimal_hours(hours: float) -> str:
+    h = int(math.floor(hours))
+    m = int(round((hours - h) * 60.0))
+    if m >= 60:
+        h += 1
+        m -= 60
+    return f"{h:02d}:{m:02d}"
+
+
+def _weather_label_to_code(label: str) -> str:
+    mapping = {
+        "晴空": "clear",
+        "少云": "partly_cloudy",
+        "多云": "cloudy",
+        "阴天": "overcast",
+        "雨雪": "rain_snow",
+        "雾霾": "haze",
+    }
+    return mapping.get(str(label).strip(), str(label).strip() or "clear")
 
 
 def _draw_block(ax, x: float, y: float, w: float, h: float, text: str, fontsize: int = 10) -> None:
@@ -394,8 +448,11 @@ class ApproximationToolGUI(tk.Tk):
         self.loop_tab = ttk.Frame(notebook)
         self.param_tab = ttk.Frame(notebook)
         self.sc_tab = ttk.Frame(notebook)
+        self.load_forecast_tab = ttk.Frame(notebook)
+        self.renewable_forecast_tab = ttk.Frame(notebook)
         self.comtrade_tab = ttk.Frame(notebook)
 
+        notebook.add(self.comtrade_tab, text="录波曲线")
         notebook.add(self.freq_tab, text="频率动态")
         notebook.add(self.osc_tab, text="机电振荡")
         notebook.add(self.volt_tab, text="电压无功分析")
@@ -404,7 +461,8 @@ class ApproximationToolGUI(tk.Tk):
         notebook.add(self.loop_tab, text="配电网合环分析")
         notebook.add(self.param_tab, text="参数校核与标幺值")
         notebook.add(self.sc_tab, text="短路电流计算")
-        notebook.add(self.comtrade_tab, text="录波曲线")
+        notebook.add(self.load_forecast_tab, text="负荷预测")
+        notebook.add(self.renewable_forecast_tab, text="新能源预测")
 
         self._line_geometry_window: tk.Toplevel | None = None
         self._line_geometry_entries: dict[str, ttk.Entry] = {}
@@ -425,6 +483,9 @@ class ApproximationToolGUI(tk.Tk):
         self._build_loop_closure_tab()
         self._build_param_tab()
         self._build_short_circuit_tab()
+        self._forecast_widgets: dict[str, dict[str, object]] = {}
+        self._build_load_forecast_tab()
+        self._build_renewable_forecast_tab()
         self._build_comtrade_tab()
         self._build_ai_sidebar()
         self._hide_tab_muted_explanations()
@@ -442,6 +503,8 @@ class ApproximationToolGUI(tk.Tk):
             self.loop_tab,
             self.param_tab,
             self.sc_tab,
+            self.load_forecast_tab,
+            self.renewable_forecast_tab,
             self.comtrade_tab,
         ]
 
@@ -831,6 +894,8 @@ class ApproximationToolGUI(tk.Tk):
             "小扰动分析（SMIB）": "PowerTool_Small_Signal_Analysis",
             "配电网合环分析": "PowerTool_Distribution_Loop_Closure_Analysis",
             "短路电流计算": "PowerTool_Short_Circuit_Current_Calculation",
+            "负荷预测": "PowerTool_Load_Forecasting",
+            "新能源预测": "PowerTool_Renewable_Forecasting",
             "录波曲线": "PowerTool_Waveform_Viewer",
         }
         return mapping.get(tab, "PowerTool_Overview")
@@ -1021,6 +1086,24 @@ class ApproximationToolGUI(tk.Tk):
             pairs = [("系统电压 / kV", self.sc_u), ("线路长度 / km", self.sc_len), ("R1 / Ω/km", self.sc_r1), ("X1 / Ω/km", self.sc_x1),
                      ("R0 / Ω/km", self.sc_r0), ("X0 / Ω/km", self.sc_x0), ("左侧中性点电阻 / Ω", self.sc_rn), ("故障电阻 / Ω", self.sc_rf),
                      ("右侧相角 / °", self.sc_delta_right), ("故障点位置 / %", self.sc_fault_pos)]
+        elif tab == "负荷预测":
+            widgets = self._forecast_widgets.get("load", {})
+            return (
+                f"数据集: {widgets.get('dataset_var').get() if widgets else '-'}\n"
+                f"预测日期: {widgets.get('date_var').get() if widgets else '-'}\n"
+                f"位置: {widgets.get('lat_entry').get() if widgets else '-'}, {widgets.get('lon_entry').get() if widgets else '-'}；海拔 {widgets.get('alt_entry').get() if widgets else '-'} m\n"
+                f"节假日国家/地区: {widgets.get('holiday_var').get() if widgets else '-'}"
+            )
+        elif tab == "新能源预测":
+            widgets = self._forecast_widgets.get("renewable", {})
+            capacity = widgets.get('capacity_entry').get() if widgets and widgets.get('capacity_entry') is not None else '-'
+            return (
+                f"数据集: {widgets.get('dataset_var').get() if widgets else '-'}\n"
+                f"预测日期: {widgets.get('date_var').get() if widgets else '-'}\n"
+                f"位置: {widgets.get('lat_entry').get() if widgets else '-'}, {widgets.get('lon_entry').get() if widgets else '-'}；海拔 {widgets.get('alt_entry').get() if widgets else '-'} m\n"
+                f"装机容量上限: {capacity} MW\n"
+                f"节假日国家/地区: {widgets.get('holiday_var').get() if widgets else '-'}；新能源类型: {widgets.get('resource_var').get() if widgets else '-'}（风电/光伏独立预测）"
+            )
         elif tab == "录波曲线":
             return f"当前录波文件: {getattr(self, '_comtrade_cfg_path', '') or '未载入'}\n当前时间窗: {self.comtrade_time_label.cget('text')}"
         else:
@@ -4549,6 +4632,765 @@ class ApproximationToolGUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("计算错误", str(exc))
 
+    def _build_load_forecast_tab(self) -> None:
+        self._build_day_ahead_forecast_tab(self.load_forecast_tab, "load")
+
+    def _build_renewable_forecast_tab(self) -> None:
+        self._build_day_ahead_forecast_tab(self.renewable_forecast_tab, "renewable")
+
+    def _build_day_ahead_forecast_tab(self, tab: ttk.Frame, kind: str) -> None:
+        title = "负荷日前预测" if kind == "load" else "新能源日前预测"
+        target_label = "预测负荷 / MW" if kind == "load" else "预测新能源出力 / MW"
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(0, weight=1)
+        left = ttk.Frame(tab, padding=16, style="Card.TFrame")
+        right = ttk.Frame(tab, padding=16, style="Card.TFrame")
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 6), pady=8)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=8)
+        left.columnconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.rowconfigure(3, weight=1)
+
+        ttk.Label(left, text=title, style="PageTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            left,
+            text="面向调度员的日前预测：内置 JSON 已配置算法库、地区模板、节假日和特殊事件；支持 24 点/96 点输出、人工选择算法和综合方案。",
+            style="Muted.TLabel", justify="left", wraplength=420,
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 10))
+
+        dataset_names = [info.name for info in list_builtin_datasets(kind)]
+        dataset_var = tk.StringVar(value=dataset_names[0] if dataset_names else "")
+        custom_path_var = tk.StringVar(value="")
+        date_var = tk.StringVar(value="2025-06-22")
+        lat_entry = self._add_entry(left, 3, "纬度 / °", f"{NANJING_LATITUDE:.4f}", width=16)
+        lon_entry = self._add_entry(left, 4, "经度 / °", f"{NANJING_LONGITUDE:.4f}", width=16)
+        alt_entry = self._add_entry(left, 5, "海拔 / m（平原可填 0）", f"{NANJING_ALTITUDE_M:.0f}", width=16)
+        date_entry = ttk.Entry(left, textvariable=date_var, width=16, style="Input.TEntry")
+        ttk.Label(left, text="预测日期（YYYY-MM-DD）", style="Form.TLabel").grid(row=6, column=0, sticky="w", padx=4, pady=4)
+        date_entry.grid(row=6, column=1, sticky="ew", padx=4, pady=4)
+        holiday_var = tk.StringVar(value="CN")
+        ttk.Label(left, text="节假日国家/地区", style="Form.TLabel").grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        holiday_box = ttk.Combobox(left, textvariable=holiday_var, values=["US", "CN"], state="readonly", width=18, style="Input.TCombobox")
+        holiday_box.grid(row=7, column=1, sticky="ew", padx=4, pady=4)
+        next_row = 8
+
+        interval_var = tk.StringVar(value="60")
+        ttk.Label(left, text="时段间隔 / min", style="Form.TLabel").grid(row=next_row, column=0, sticky="w", padx=4, pady=4)
+        interval_box = ttk.Combobox(left, textvariable=interval_var, values=["60", "30", "15"], state="readonly", width=18, style="Input.TCombobox")
+        interval_box.grid(row=next_row, column=1, sticky="ew", padx=4, pady=4)
+        next_row += 1
+
+        algorithm_infos = list_forecast_algorithms(kind)
+        algorithm_labels = [f"{info.label} ({info.code})" for info in algorithm_infos]
+        algorithm_by_label = {f"{info.label} ({info.code})": info.code for info in algorithm_infos}
+        default_alg_label = next((label for label in algorithm_labels if label.endswith("(adaptive_ensemble)")), algorithm_labels[0] if algorithm_labels else "adaptive_ensemble")
+        algorithm_var = tk.StringVar(value=default_alg_label)
+        ttk.Label(left, text="预测算法", style="Form.TLabel").grid(row=next_row, column=0, sticky="w", padx=4, pady=4)
+        algorithm_box = ttk.Combobox(left, textvariable=algorithm_var, values=algorithm_labels, state="readonly", width=26, style="Input.TCombobox")
+        algorithm_box.grid(row=next_row, column=1, sticky="ew", padx=4, pady=4)
+        next_row += 1
+
+        capacity_entry = None
+        resource_var = tk.StringVar(value="solar")
+        solar_time_var = tk.StringVar(value="12:00")
+        weather_var = tk.StringVar(value="晴空")
+        cloud_entry = None
+        irr_adjust_entry = None
+        tilt_entry = None
+        pv_azimuth_entry = None
+        albedo_entry = None
+        temp_coeff_entry = None
+        if kind == "renewable":
+            capacity_entry = self._add_entry(left, next_row, "装机容量上限 / MW", "23000", width=16)
+            next_row += 1
+            ttk.Label(left, text="新能源类型", style="Form.TLabel").grid(row=next_row, column=0, sticky="w", padx=4, pady=4)
+            resource_box = ttk.Combobox(left, textvariable=resource_var, values=["solar", "wind"], state="readonly", width=18, style="Input.TCombobox")
+            resource_box.grid(row=next_row, column=1, sticky="ew", padx=4, pady=4)
+            next_row += 1
+            ttk.Label(left, text="天气场景", style="Form.TLabel").grid(row=next_row, column=0, sticky="w", padx=4, pady=4)
+            weather_box = ttk.Combobox(left, textvariable=weather_var, values=["晴空", "少云", "多云", "阴天", "雨雪", "雾霾"], state="readonly", width=18, style="Input.TCombobox")
+            weather_box.grid(row=next_row, column=1, sticky="ew", padx=4, pady=4)
+            next_row += 1
+            cloud_entry = self._add_entry(left, next_row, "云量 / %", "0", width=16)
+            next_row += 1
+            irr_adjust_entry = self._add_entry(left, next_row, "辐照人工系数", "1.00", width=16)
+            next_row += 1
+            tilt_entry = self._add_entry(left, next_row, "组件倾角 / °", "30", width=16)
+            next_row += 1
+            pv_azimuth_entry = self._add_entry(left, next_row, "组件方位角 / °", "180", width=16)
+            next_row += 1
+            albedo_entry = self._add_entry(left, next_row, "地表反照率", "0.20", width=16)
+            next_row += 1
+            temp_coeff_entry = self._add_entry(left, next_row, "组件温度系数 %/℃", "-0.35", width=16)
+            next_row += 1
+
+        ttk.Label(left, text="训练数据集", style="Form.TLabel").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        dataset_box = ttk.Combobox(left, textvariable=dataset_var, values=dataset_names, state="readonly", width=26, style="Input.TCombobox")
+        dataset_box.grid(row=2, column=1, sticky="ew", padx=4, pady=4)
+        button_row = ttk.Frame(left, style="Card.TFrame")
+        button_row.grid(row=next_row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        for col in range(4):
+            button_row.columnconfigure(col, weight=1)
+        ttk.Button(button_row, text="导入CSV", command=lambda: self._import_forecast_csv(kind)).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(button_row, text="预测", style="Accent.TButton", command=lambda: self._run_day_ahead_forecast(kind)).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(button_row, text="导出JSON", command=lambda: self._export_forecast_result(kind, "json")).grid(row=0, column=2, sticky="ew", padx=(4, 4))
+        ttk.Button(button_row, text="导出CSV", command=lambda: self._export_forecast_result(kind, "csv")).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+
+        info_var = tk.StringVar(value="")
+        ttk.Label(left, textvariable=info_var, style="Card.TLabel", justify="left", wraplength=420).grid(row=next_row + 1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        ttk.Label(right, text=f"{title}结果", style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
+        result_text = ScrolledText(right, width=94, height=14, wrap=tk.NONE, font="TkFixedFont")
+        result_text.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
+        self._style_text_widget(result_text)
+        result_text.insert("1.0", "请选择数据集、算法和时段间隔，然后点击“预测”。")
+        result_text.configure(state="disabled")
+
+        view_book = ttk.Notebook(right)
+        view_book.grid(row=3, column=0, sticky="nsew")
+        curve_tab = ttk.Frame(view_book, style="Card.TFrame")
+        table_tab = ttk.Frame(view_book, style="Card.TFrame")
+        metric_tab = ttk.Frame(view_book, style="Card.TFrame")
+        solar_tab = None
+        view_book.add(curve_tab, text="曲线")
+        view_book.add(table_tab, text="24/96点明细")
+        view_book.add(metric_tab, text="算法与日特性")
+        if kind == "renewable":
+            solar_tab = ttk.Frame(view_book, style="Card.TFrame")
+            view_book.add(solar_tab, text="太阳角度/轨迹")
+        curve_tab.columnconfigure(0, weight=1)
+        curve_tab.rowconfigure(1, weight=1)
+        table_tab.columnconfigure(0, weight=1)
+        table_tab.rowconfigure(0, weight=1)
+        metric_tab.columnconfigure(0, weight=1)
+        metric_tab.rowconfigure(0, weight=1)
+        if solar_tab is not None:
+            solar_tab.columnconfigure(0, weight=1)
+            solar_tab.rowconfigure(1, weight=1)
+
+        fig = Figure(figsize=(8.8, 3.8), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.set_title(target_label)
+        ax.set_xlabel("Hour")
+        ax.set_ylabel("MW")
+        ax.grid(True)
+        canvas = FigureCanvasTkAgg(fig, master=curve_tab)
+        toolbar = NavigationToolbar2Tk(canvas, curve_tab, pack_toolbar=False)
+        toolbar.update()
+        toolbar.grid(row=0, column=0, sticky="ew")
+        canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        canvas.draw()
+
+        if kind == "renewable":
+            detail_columns = ("time", "p10", "value", "p90", "temp", "ghi", "poa", "sun_alt", "sun_az", "incidence", "weather", "pv_factor", "wind", "drivers")
+        else:
+            detail_columns = ("time", "p10", "value", "p90", "temp", "ghi", "wind", "drivers")
+        detail_tree = ttk.Treeview(table_tab, columns=detail_columns, show="headings", height=14)
+        detail_headers = {
+            "time": "时间", "p10": "P10/MW", "value": "预测/MW", "p90": "P90/MW", "temp": "温度℃", "ghi": "GHI",
+            "poa": "POA", "sun_alt": "太阳高°", "sun_az": "方位°", "incidence": "入射°", "weather": "天气系数", "pv_factor": "PV修正",
+            "wind": "风速", "drivers": "调度提示"
+        }
+        detail_widths = {"time": 145, "p10": 80, "value": 90, "p90": 80, "temp": 70, "ghi": 70, "poa": 70, "sun_alt": 78, "sun_az": 70, "incidence": 70, "weather": 80, "pv_factor": 70, "wind": 70, "drivers": 520}
+        for col in detail_columns:
+            detail_tree.heading(col, text=detail_headers[col])
+            detail_tree.column(col, width=detail_widths[col], anchor="w" if col in {"time", "drivers"} else "e")
+        detail_tree.grid(row=0, column=0, sticky="nsew")
+        detail_scroll_y = ttk.Scrollbar(table_tab, orient="vertical", command=detail_tree.yview)
+        detail_scroll_x = ttk.Scrollbar(table_tab, orient="horizontal", command=detail_tree.xview)
+        detail_tree.configure(yscrollcommand=detail_scroll_y.set, xscrollcommand=detail_scroll_x.set)
+        detail_scroll_y.grid(row=0, column=1, sticky="ns")
+        detail_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        metric_text = ScrolledText(metric_tab, width=86, height=12, wrap=tk.NONE, font="TkFixedFont")
+        metric_text.grid(row=0, column=0, sticky="nsew")
+        self._style_text_widget(metric_text)
+        metric_text.insert("1.0", "预测完成后显示算法权重、留出校验误差、峰谷差、负荷率/容量因子等信息。")
+        metric_text.configure(state="disabled")
+
+        solar_result_text = None
+        solar_fig = None
+        solar_canvas = None
+        solar_axes = None
+        solar_time_slider = None
+        solar_time_note_var = None
+        solar_time_entry = None
+        if solar_tab is not None:
+            solar_tab.rowconfigure(0, weight=0)
+            solar_tab.rowconfigure(1, weight=0)
+            solar_tab.rowconfigure(2, weight=1)
+            solar_tab.rowconfigure(3, weight=0)
+            solar_result_text = ScrolledText(solar_tab, width=94, height=6, wrap=tk.WORD, font="TkFixedFont")
+            solar_result_text.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+            self._style_text_widget(solar_result_text)
+            solar_result_text.insert("1.0", "太阳角度、天气修正 GHI 与组件 POA 将自动联动到新能源预测。可在下方拖拽日照区间滑条，或直接在右侧曲线区拖拽当前时刻。")
+            solar_result_text.configure(state="disabled")
+
+            solar_fig = Figure(figsize=(9.4, 5.0), dpi=100)
+            solar_ax_polar = solar_fig.add_subplot(121, projection="polar")
+            solar_ax_curve = solar_fig.add_subplot(122)
+            solar_canvas = FigureCanvasTkAgg(solar_fig, master=solar_tab)
+            solar_toolbar = NavigationToolbar2Tk(solar_canvas, solar_tab, pack_toolbar=False)
+            solar_toolbar.update()
+            solar_toolbar.grid(row=1, column=0, sticky="ew")
+            solar_canvas.get_tk_widget().grid(row=2, column=0, sticky="nsew")
+            solar_axes = (solar_ax_polar, solar_ax_curve)
+
+            solar_control = ttk.Frame(solar_tab, style="Card.TFrame")
+            solar_control.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+            solar_control.columnconfigure(2, weight=1)
+            ttk.Label(solar_control, text="分析时刻", style="Form.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 4), pady=2)
+            solar_time_entry = ttk.Entry(solar_control, textvariable=solar_time_var, width=8, style="Input.TEntry")
+            solar_time_entry.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=2)
+            solar_time_slider = ttk.Scale(solar_control, from_=0, to=1440, orient="horizontal", command=self._on_solar_time_slider)
+            solar_time_slider.grid(row=0, column=2, sticky="ew", padx=(0, 8), pady=2)
+            ttk.Button(solar_control, text="刷新太阳图", command=self._run_renewable_solar_helper).grid(row=0, column=3, sticky="e", padx=(0, 0), pady=2)
+            solar_time_note_var = tk.StringVar(value="日照区间生成后，可拖拽滑条；也可在太阳高度曲线区域拖拽选择当前时刻。")
+            ttk.Label(solar_control, textvariable=solar_time_note_var, style="Muted.TLabel", justify="right").grid(row=1, column=0, columnspan=4, sticky="e", pady=(0, 2))
+
+            solar_canvas.mpl_connect("button_press_event", self._on_solar_plot_button_press)
+            solar_canvas.mpl_connect("motion_notify_event", self._on_solar_plot_motion)
+            solar_canvas.mpl_connect("button_release_event", self._on_solar_plot_button_release)
+            solar_canvas.draw()
+
+        self._forecast_widgets[kind] = {
+            "dataset_var": dataset_var,
+            "custom_path_var": custom_path_var,
+            "date_var": date_var,
+            "lat_entry": lat_entry,
+            "lon_entry": lon_entry,
+            "alt_entry": alt_entry,
+            "holiday_var": holiday_var,
+            "capacity_entry": capacity_entry,
+            "resource_var": resource_var,
+            "solar_time_var": solar_time_var,
+            "weather_var": weather_var,
+            "cloud_entry": cloud_entry,
+            "irr_adjust_entry": irr_adjust_entry,
+            "tilt_entry": tilt_entry,
+            "pv_azimuth_entry": pv_azimuth_entry,
+            "albedo_entry": albedo_entry,
+            "temp_coeff_entry": temp_coeff_entry,
+            "interval_var": interval_var,
+            "algorithm_var": algorithm_var,
+            "algorithm_by_label": algorithm_by_label,
+            "info_var": info_var,
+            "result_text": result_text,
+            "metric_text": metric_text,
+            "detail_tree": detail_tree,
+            "fig": fig,
+            "ax": ax,
+            "canvas": canvas,
+            "solar_result_text": solar_result_text,
+            "solar_fig": solar_fig,
+            "solar_canvas": solar_canvas,
+            "solar_axes": solar_axes,
+            "solar_time_entry": solar_time_entry,
+            "solar_time_slider": solar_time_slider,
+            "solar_time_note_var": solar_time_note_var,
+            "solar_slider_updating": False,
+            "solar_slider_after_id": None,
+            "solar_plot_dragging": False,
+            "solar_curve_axes": (),
+            "solar_time_bounds_min": (0.0, 1440.0),
+            "last_result": None,
+            "last_solar_profile": None,
+        }
+        dataset_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_forecast_dataset_defaults(kind))
+        algorithm_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_forecast_algorithm_hint(kind))
+        self._apply_forecast_dataset_defaults(kind, update_location=False)
+        self._apply_forecast_algorithm_hint(kind)
+        if kind == "renewable":
+            self._run_renewable_solar_helper(silent=True)
+
+    def _apply_forecast_dataset_defaults(self, kind: str, update_location: bool = True) -> None:
+        widgets = self._forecast_widgets.get(kind)
+        if not widgets:
+            return
+        dataset_name = widgets["dataset_var"].get()  # type: ignore[union-attr]
+        if not dataset_name or str(dataset_name).startswith("CSV:"):
+            return
+        info = builtin_dataset_info(str(dataset_name))
+        if update_location:
+            for key, value in (("lat_entry", info.latitude), ("lon_entry", info.longitude), ("alt_entry", info.altitude_m)):
+                entry = widgets[key]
+                entry.delete(0, tk.END)  # type: ignore[attr-defined]
+                entry.insert(0, f"{value:.5g}")  # type: ignore[attr-defined]
+        if info.region.lower().startswith("china") or "China" in info.region or not update_location:
+            widgets["holiday_var"].set("CN")  # type: ignore[union-attr]
+        if update_location:
+            climate = classify_climate_block(info.latitude, info.longitude, info.altitude_m)
+        else:
+            climate = classify_climate_block(
+                _safe_float(widgets["lat_entry"].get(), "纬度"),  # type: ignore[attr-defined]
+                _safe_float(widgets["lon_entry"].get(), "经度"),  # type: ignore[attr-defined]
+                _safe_float(widgets["alt_entry"].get(), "海拔"),  # type: ignore[attr-defined]
+            )
+        resource_hint = "\n提示：新能源预测只对所选风电或光伏资源独立建模。" if kind == "renewable" else ""
+        widgets["info_var"].set(f"{info.region}\n来源：{info.source}\n自动气候板块：{climate}{resource_hint}\n{info.notes}")  # type: ignore[union-attr]
+        self._apply_forecast_algorithm_hint(kind)
+        if kind == "renewable":
+            self._run_renewable_solar_helper(silent=True)
+
+    def _apply_forecast_algorithm_hint(self, kind: str) -> None:
+        widgets = self._forecast_widgets.get(kind)
+        if not widgets:
+            return
+        label = widgets["algorithm_var"].get()  # type: ignore[union-attr]
+        code = widgets.get("algorithm_by_label", {}).get(label, "adaptive_ensemble")  # type: ignore[union-attr]
+        info_text = widgets["info_var"].get()  # type: ignore[union-attr]
+        for info in list_forecast_algorithms(kind):
+            if info.code == code:
+                short = f"\n算法：{info.label}。{info.description}"
+                base = info_text.split("\n算法：", 1)[0]
+                widgets["info_var"].set(base + short)  # type: ignore[union-attr]
+                break
+
+    def _import_forecast_csv(self, kind: str) -> None:
+        widgets = self._forecast_widgets.get(kind)
+        if not widgets:
+            return
+        filename = filedialog.askopenfilename(title="选择预测训练CSV", filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not filename:
+            return
+        widgets["custom_path_var"].set(filename)  # type: ignore[union-attr]
+        widgets["dataset_var"].set(f"CSV: {Path(filename).name}")  # type: ignore[union-attr]
+        widgets["info_var"].set("已选择外部 CSV。支持 timestamp/load_mw/demand_mw/solar_mw/wind_mw/renewable_mw/temperature_c/ghi_wm2/wind_speed_mps，以及中文 日期/时刻/统调负荷/气温、Baidu KDD Tmstamp/Wspd/Patv 等表头。")  # type: ignore[union-attr]
+        self._apply_forecast_algorithm_hint(kind)
+
+    def _run_day_ahead_forecast(self, kind: str) -> None:
+        widgets = self._forecast_widgets[kind]
+        try:
+            dataset_name = widgets["dataset_var"].get()  # type: ignore[union-attr]
+            if str(dataset_name).startswith("CSV:"):
+                rows = load_forecast_csv(widgets["custom_path_var"].get(), kind)  # type: ignore[union-attr]
+            else:
+                rows = load_builtin_forecast_dataset(str(dataset_name))
+            target = datetime.strptime(widgets["date_var"].get().strip(), "%Y-%m-%d").date()  # type: ignore[union-attr]
+            capacity_entry = widgets.get("capacity_entry")
+            capacity = None if capacity_entry is None else _safe_float(capacity_entry.get(), "装机容量上限")  # type: ignore[attr-defined]
+            interval_minutes = int(widgets["interval_var"].get())  # type: ignore[union-attr]
+            algorithm_label = widgets["algorithm_var"].get()  # type: ignore[union-attr]
+            algorithm = widgets.get("algorithm_by_label", {}).get(algorithm_label, "adaptive_ensemble")  # type: ignore[union-attr]
+            weather_condition = _weather_label_to_code(widgets["weather_var"].get()) if kind == "renewable" else "clear"  # type: ignore[union-attr]
+            cloud = _safe_float(widgets["cloud_entry"].get(), "云量") if kind == "renewable" and widgets.get("cloud_entry") is not None else 0.0  # type: ignore[attr-defined]
+            irr_adjust = _safe_float(widgets["irr_adjust_entry"].get(), "辐照人工系数") if kind == "renewable" and widgets.get("irr_adjust_entry") is not None else 1.0  # type: ignore[attr-defined]
+            tilt = _safe_float(widgets["tilt_entry"].get(), "组件倾角") if kind == "renewable" and widgets.get("tilt_entry") is not None else 30.0  # type: ignore[attr-defined]
+            pv_azimuth = _safe_float(widgets["pv_azimuth_entry"].get(), "组件方位角") if kind == "renewable" and widgets.get("pv_azimuth_entry") is not None else 180.0  # type: ignore[attr-defined]
+            albedo = _safe_float(widgets["albedo_entry"].get(), "地表反照率") if kind == "renewable" and widgets.get("albedo_entry") is not None else 0.20  # type: ignore[attr-defined]
+            temp_coeff = _safe_float(widgets["temp_coeff_entry"].get(), "组件温度系数") if kind == "renewable" and widgets.get("temp_coeff_entry") is not None else -0.35  # type: ignore[attr-defined]
+            config = ForecastConfig(
+                kind=kind,
+                target_date=target,
+                latitude=_safe_float(widgets["lat_entry"].get(), "纬度"),  # type: ignore[attr-defined]
+                longitude=_safe_float(widgets["lon_entry"].get(), "经度"),  # type: ignore[attr-defined]
+                altitude_m=_safe_float(widgets["alt_entry"].get(), "海拔"),  # type: ignore[attr-defined]
+                holiday_country=widgets["holiday_var"].get(),  # type: ignore[union-attr]
+                renewable_capacity_mw=capacity,
+                renewable_resource=widgets["resource_var"].get(),  # type: ignore[union-attr]
+                algorithm=str(algorithm),
+                interval_minutes=interval_minutes,
+                horizon_hours=24,
+                weather_condition=weather_condition,
+                cloud_cover_pct=cloud,
+                irradiance_adjustment=irr_adjust,
+                pv_tilt_deg=tilt,
+                pv_azimuth_deg=pv_azimuth,
+                pv_albedo=albedo,
+                pv_temp_coeff_pct_per_c=temp_coeff,
+            )
+            result = forecast_day_ahead(rows, config)
+            widgets["last_result"] = result
+            self._set_text(widgets["result_text"], format_forecast_summary(result))  # type: ignore[arg-type]
+            self._plot_day_ahead_forecast(kind, result)
+            self._fill_forecast_detail_table(kind, result)
+            self._fill_forecast_metric_text(kind, result)
+            if kind == "renewable":
+                self._run_renewable_solar_helper(silent=True)
+        except Exception as exc:
+            messagebox.showerror("预测失败", str(exc))
+
+    @staticmethod
+    def _day_minutes(dt: datetime | None) -> float:
+        if dt is None:
+            return 0.0
+        return dt.hour * 60.0 + dt.minute + dt.second / 60.0
+
+    @staticmethod
+    def _minutes_to_hhmm(minutes: float) -> str:
+        minutes_i = int(round(float(minutes))) % (24 * 60)
+        return f"{minutes_i // 60:02d}:{minutes_i % 60:02d}"
+
+    def _update_solar_time_controls(self, profile, analysis_ts: datetime) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets:
+            return
+        if profile.sunrise is not None and profile.sunset is not None:
+            lower = max(0.0, self._day_minutes(profile.sunrise))
+            upper = min(24.0 * 60.0, self._day_minutes(profile.sunset))
+            if upper <= lower:
+                lower, upper = 0.0, 24.0 * 60.0
+            note = f"日照区间：{_format_clock(profile.sunrise)}—{_format_clock(profile.sunset)}；拖拽滑条或曲线区选择当前时刻。"
+        else:
+            lower, upper = 0.0, 24.0 * 60.0
+            note = "当天无常规日出/日落区间；滑条按 00:00—24:00 显示。"
+        widgets["solar_time_bounds_min"] = (lower, upper)
+        slider = widgets.get("solar_time_slider")
+        if slider is not None:
+            widgets["solar_slider_updating"] = True
+            try:
+                slider.configure(from_=lower, to=upper)  # type: ignore[attr-defined]
+                current = self._day_minutes(analysis_ts)
+                slider.set(min(max(current, lower), upper))  # type: ignore[attr-defined]
+            finally:
+                widgets["solar_slider_updating"] = False
+        note_var = widgets.get("solar_time_note_var")
+        if note_var is not None:
+            note_var.set(note)  # type: ignore[attr-defined]
+
+    def _set_renewable_solar_time_from_minutes(self, minutes: float, redraw: bool = True) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets:
+            return
+        lower, upper = widgets.get("solar_time_bounds_min", (0.0, 24.0 * 60.0))
+        minutes = min(max(float(minutes), float(lower)), float(upper))
+        widgets["solar_time_var"].set(self._minutes_to_hhmm(minutes))  # type: ignore[union-attr]
+        if not redraw:
+            return
+        after_id = widgets.get("solar_slider_after_id")
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        widgets["solar_slider_after_id"] = self.after(140, lambda: self._run_renewable_solar_helper(silent=True))
+
+    def _on_solar_time_slider(self, value: str) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets or widgets.get("solar_slider_updating"):
+            return
+        try:
+            minutes = float(value)
+        except (TypeError, ValueError):
+            return
+        self._set_renewable_solar_time_from_minutes(minutes, redraw=True)
+
+    def _solar_event_minutes(self, event) -> float | None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets or event.xdata is None:
+            return None
+        axes = tuple(widgets.get("solar_curve_axes", ()))
+        if axes and event.inaxes not in axes:
+            return None
+        lower, upper = widgets.get("solar_time_bounds_min", (0.0, 24.0 * 60.0))
+        return min(max(float(event.xdata) * 60.0, float(lower)), float(upper))
+
+    def _on_solar_plot_button_press(self, event) -> None:
+        if getattr(event, "button", None) != 1:
+            return
+        minutes = self._solar_event_minutes(event)
+        if minutes is None:
+            return
+        widgets = self._forecast_widgets.get("renewable")
+        if widgets is not None:
+            widgets["solar_plot_dragging"] = True
+        self._set_renewable_solar_time_from_minutes(minutes, redraw=True)
+
+    def _on_solar_plot_motion(self, event) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets or not widgets.get("solar_plot_dragging"):
+            return
+        minutes = self._solar_event_minutes(event)
+        if minutes is None:
+            return
+        self._set_renewable_solar_time_from_minutes(minutes, redraw=True)
+
+    def _on_solar_plot_button_release(self, event) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets:
+            return
+        widgets["solar_plot_dragging"] = False
+        minutes = self._solar_event_minutes(event)
+        if minutes is not None:
+            self._set_renewable_solar_time_from_minutes(minutes, redraw=True)
+
+    def _run_renewable_solar_helper(self, silent: bool = False) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets:
+            return
+        try:
+            target_date = datetime.strptime(widgets["date_var"].get().strip(), "%Y-%m-%d").date()  # type: ignore[union-attr]
+            time_text = widgets.get("solar_time_var").get().strip() or "12:00"  # type: ignore[union-attr]
+            try:
+                analysis_ts = datetime.strptime(f"{target_date.isoformat()} {time_text}", "%Y-%m-%d %H:%M")
+            except ValueError:
+                analysis_ts = datetime.strptime(f"{target_date.isoformat()} {time_text}", "%Y-%m-%d %H")
+            latitude = _safe_float(widgets["lat_entry"].get(), "纬度")  # type: ignore[attr-defined]
+            longitude = _safe_float(widgets["lon_entry"].get(), "经度")  # type: ignore[attr-defined]
+            weather_condition = _weather_label_to_code(widgets["weather_var"].get())  # type: ignore[union-attr]
+            cloud = _safe_float(widgets["cloud_entry"].get(), "云量") if widgets.get("cloud_entry") is not None else 0.0  # type: ignore[attr-defined]
+            irr_adjust = _safe_float(widgets["irr_adjust_entry"].get(), "辐照人工系数") if widgets.get("irr_adjust_entry") is not None else 1.0  # type: ignore[attr-defined]
+            tilt = _safe_float(widgets["tilt_entry"].get(), "组件倾角") if widgets.get("tilt_entry") is not None else 30.0  # type: ignore[attr-defined]
+            pv_azimuth = _safe_float(widgets["pv_azimuth_entry"].get(), "组件方位角") if widgets.get("pv_azimuth_entry") is not None else 180.0  # type: ignore[attr-defined]
+            albedo = _safe_float(widgets["albedo_entry"].get(), "地表反照率") if widgets.get("albedo_entry") is not None else 0.20  # type: ignore[attr-defined]
+            temp_coeff = _safe_float(widgets["temp_coeff_entry"].get(), "组件温度系数") if widgets.get("temp_coeff_entry") is not None else -0.35  # type: ignore[attr-defined]
+            temp = 25.0
+            pos = solar_position(analysis_ts, latitude, longitude)
+            irr = solar_irradiance_on_panel(
+                analysis_ts, latitude, longitude, temp,
+                weather_condition, cloud, irr_adjust,
+                tilt, pv_azimuth, albedo, temp_coeff,
+            )
+            profile = solar_day_profile(target_date, latitude, longitude, pos.timezone_offset_hours, step_minutes=10)
+            self._update_solar_time_controls(profile, analysis_ts)
+            irradiance_profile = tuple(
+                solar_irradiance_on_panel(
+                    p.timestamp, latitude, longitude, temp,
+                    weather_condition, cloud, irr_adjust,
+                    tilt, pv_azimuth, albedo, temp_coeff,
+                )
+                for p in profile.points
+            )
+            widgets["last_solar_profile"] = (pos, profile, irr, irradiance_profile)
+
+            direction_labels = [
+                "正北", "东北偏北", "东北", "东北偏东", "正东", "东南偏东", "东南", "东南偏南",
+                "正南", "西南偏南", "西南", "西南偏西", "正西", "西北偏西", "西北", "西北偏北",
+            ]
+            direction = direction_labels[int(((pos.azimuth_deg % 360.0) + 11.25) // 22.5) % 16]
+            visibility = "太阳位于地平线上方" if pos.altitude_deg > 0.0 else "太阳位于地平线以下"
+            lines = [
+                "══ 太阳角度与光伏修正辅助分析 ═══════════════",
+                f"位置：纬度 {latitude:.4f}°，经度 {longitude:.4f}°；自动采用标准时区 {_format_utc_offset(pos.timezone_offset_hours)}（标准经线 {profile.standard_meridian_deg:.1f}°）",
+                f"分析时刻：{analysis_ts:%Y-%m-%d %H:%M}（标准时） / 对应太阳时 {_format_decimal_hours(pos.local_solar_time_hours % 24.0)}",
+                f"当前太阳高度角：{pos.altitude_deg:.2f}°   天顶角：{pos.zenith_deg:.2f}°   方位角：{pos.azimuth_deg:.2f}°（{direction}）",
+                f"晴空水平 GHI：{pos.clear_sky_ghi_wm2:.0f} W/m2；天气修正后 GHI：{irr.corrected_ghi_wm2:.0f} W/m2；倾斜面 POA：{irr.poa_wm2:.0f} W/m2",
+                f"直射水平：{irr.direct_horizontal_wm2:.0f} W/m2；散射水平：{irr.diffuse_horizontal_wm2:.0f} W/m2；入射角：{irr.incidence_angle_deg:.2f}°",
+                f"天气：{widgets['weather_var'].get()}，云量={cloud:.0f}%，辐照人工系数={irr_adjust:.2f}，天气系数={irr.weather_factor:.2f}",  # type: ignore[index]
+                f"组件：倾角={tilt:.1f}°，方位角={pv_azimuth:.1f}°，地表反照率={albedo:.2f}，温度系数={temp_coeff:.3f}%/℃，相对功率修正={irr.pv_power_factor:.3f}",
+                f"太阳赤纬：{pos.declination_deg:.2f}°   时差方程：{pos.equation_of_time_min:+.2f} min   时角：{pos.hour_angle_deg:+.2f}°   状态：{visibility}",
+                "",
+                "当日太阳轨迹摘要：",
+                f"  日出：{_format_clock(profile.sunrise)}    太阳正午：{_format_clock(profile.solar_noon)}    日落：{_format_clock(profile.sunset)}",
+                f"  正午太阳高度角：{profile.solar_noon_altitude_deg:.2f}°    白昼长度：{profile.daylight_hours:.2f} h",
+                "说明：方位角采用 0°=正北、90°=正东、180°=正南、270°=正西；可在下方滑条或右侧曲线区拖拽当前时刻，POA 已用于新能源预测。",
+            ]
+            if widgets.get("solar_result_text") is not None:
+                self._set_text(widgets["solar_result_text"], "\n".join(lines))  # type: ignore[arg-type]
+            self._plot_renewable_solar_helper(pos, profile, irradiance_profile)
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror("太阳角度分析失败", str(exc))
+
+    def _plot_renewable_solar_helper(self, pos, profile, irradiance_profile=()) -> None:
+        widgets = self._forecast_widgets.get("renewable")
+        if not widgets or widgets.get("solar_fig") is None or widgets.get("solar_canvas") is None:
+            return
+        fig = widgets["solar_fig"]
+        fig.clear()
+        ax_polar = fig.add_subplot(121, projection="polar")
+        ax_curve = fig.add_subplot(122)
+        fig.subplots_adjust(left=0.06, right=0.88, top=0.84, bottom=0.18, wspace=0.42)
+
+        daylight_points = [p for p in profile.points if p.altitude_deg >= 0.0]
+        if daylight_points:
+            theta = np.radians([p.azimuth_deg for p in daylight_points])
+            radius = [90.0 - p.altitude_deg for p in daylight_points]
+            ax_polar.plot(theta, radius, color="#f39c12", linewidth=2.2, label="太阳轨迹")
+            ax_polar.fill(theta, radius, color="#f7dc6f", alpha=0.25)
+        current_r = min(90.0, max(0.0, 90.0 - max(pos.altitude_deg, 0.0)))
+        ax_polar.scatter([math.radians(pos.azimuth_deg)], [current_r], s=85, color="#d35400", zorder=5, label="当前时刻")
+        ax_polar.set_theta_zero_location("N")
+        ax_polar.set_theta_direction(-1)
+        ax_polar.set_ylim(0, 90)
+        ax_polar.set_rticks([0, 30, 60, 90])
+        ax_polar.set_yticklabels(["90°", "60°", "30°", "0°"])
+        ax_polar.set_rlabel_position(135)
+        ax_polar.set_thetagrids(range(0, 360, 45), labels=["北", "东北", "东", "东南", "南", "西南", "西", "西北"])
+        ax_polar.grid(True, alpha=0.35)
+        ax_polar.set_title("太阳穹顶轨迹图\n（中心=天顶，外圈=地平线）", fontsize=11)
+        if daylight_points:
+            ax_polar.legend(loc="lower left", fontsize=8)
+
+        midnight = datetime.combine(profile.target_date, datetime.min.time())
+        x_hours = [(p.timestamp - midnight).total_seconds() / 3600.0 for p in profile.points]
+        altitudes = [p.altitude_deg for p in profile.points]
+        clear_ghis = [p.clear_sky_ghi_wm2 for p in profile.points]
+        if irradiance_profile:
+            corrected_ghis = [irr.corrected_ghi_wm2 for irr in irradiance_profile]
+            poas = [irr.poa_wm2 for irr in irradiance_profile]
+        else:
+            corrected_ghis = clear_ghis
+            poas = clear_ghis
+
+        alt_line = ax_curve.plot(x_hours, altitudes, color="#1f77b4", linewidth=2.0, label="高度角 / °")[0]
+        ax_curve.fill_between(x_hours, altitudes, [0.0] * len(altitudes), where=np.array(altitudes) > 0.0, color="#cfe2f3", alpha=0.55)
+        ax_curve.axhline(0.0, color="#7f8c8d", linewidth=1.0, linestyle="--")
+        ax_curve.set_xlim(0, 24)
+        ax_curve.set_xticks(range(0, 25, 2))
+        ax_curve.set_xlabel("标准时 / h")
+        ax_curve.set_ylabel("太阳高度角 / °")
+        ax_curve.set_ylim(min(-15.0, min(altitudes) - 2.0), max(90.0, max(altitudes) + 3.0))
+        ax_curve.grid(True, alpha=0.3)
+
+        ax_ghi = ax_curve.twinx()
+        clear_line = ax_ghi.plot(x_hours, clear_ghis, color="#f39c12", linewidth=1.4, linestyle="--", label="晴空 GHI / W/m2")[0]
+        corr_line = ax_ghi.plot(x_hours, corrected_ghis, color="#e67e22", linewidth=1.8, label="天气修正 GHI / W/m2")[0]
+        poa_line = ax_ghi.plot(x_hours, poas, color="#c0392b", linewidth=2.0, label="组件 POA / W/m2")[0]
+        ax_ghi.fill_between(x_hours, poas, [0.0] * len(poas), color="#fdebd0", alpha=0.28)
+        ax_ghi.set_ylabel("辐照度 / W/m2")
+        all_irrad = clear_ghis + corrected_ghis + poas
+        ax_ghi.set_ylim(0, max(1000.0, max(all_irrad) * 1.12 if all_irrad else 1000.0))
+
+        line_positions = [
+            (profile.sunrise, "日出", "#27ae60"),
+            (profile.solar_noon, "正午", "#8e44ad"),
+            (profile.sunset, "日落", "#c0392b"),
+            (pos.timestamp, "当前", "#d35400"),
+        ]
+        for idx, (dt, label, color) in enumerate(line_positions):
+            if dt is None:
+                continue
+            hour = (dt - midnight).total_seconds() / 3600.0
+            if 0.0 <= hour <= 24.0:
+                ax_curve.axvline(hour, color=color, linestyle=":" if label != "当前" else "-.", linewidth=1.2, alpha=0.9)
+                y_top = ax_curve.get_ylim()[1]
+                y_text = y_top - 4.0 - (idx % 2) * 9.0
+                ax_curve.text(hour, y_text, f"{label}\n{dt:%H:%M}", ha="center", va="top", fontsize=8, color=color,
+                              bbox=dict(boxstyle="round,pad=0.18", fc="white", ec=color, alpha=0.82))
+
+        ax_curve.set_title(
+            f"{profile.target_date:%Y-%m-%d} 全天太阳高度、天气修正 GHI 与组件 POA\n"
+            f"正午 {profile.solar_noon:%H:%M}，当前 {pos.timestamp:%H:%M}"
+        )
+        lines = [alt_line, clear_line, corr_line, poa_line]
+        ax_curve.legend(lines, [line.get_label() for line in lines], loc="upper left", fontsize=8)
+
+        widgets["solar_axes"] = (ax_polar, ax_curve, ax_ghi)
+        widgets["solar_curve_axes"] = (ax_curve, ax_ghi)
+        widgets["solar_canvas"].draw()  # type: ignore[attr-defined]
+
+    def _fill_forecast_detail_table(self, kind: str, result) -> None:
+        widgets = self._forecast_widgets[kind]
+        tree = widgets["detail_tree"]
+        for item in tree.get_children():  # type: ignore[attr-defined]
+            tree.delete(item)  # type: ignore[attr-defined]
+        for p in result.points:
+            if kind == "renewable":
+                values = (
+                    f"{p.timestamp:%Y-%m-%d %H:%M}",
+                    f"{p.p10_mw:.1f}",
+                    f"{p.value_mw:.1f}",
+                    f"{p.p90_mw:.1f}",
+                    f"{p.temperature_c:.1f}",
+                    f"{p.ghi_wm2:.0f}",
+                    f"{p.poa_wm2:.0f}",
+                    f"{p.solar_altitude_deg:.1f}",
+                    f"{p.solar_azimuth_deg:.0f}",
+                    f"{p.incidence_angle_deg:.1f}",
+                    f"{p.weather_factor:.2f}",
+                    f"{p.pv_power_factor:.2f}",
+                    f"{p.wind_speed_mps:.1f}",
+                    p.drivers,
+                )
+            else:
+                values = (
+                    f"{p.timestamp:%Y-%m-%d %H:%M}",
+                    f"{p.p10_mw:.1f}",
+                    f"{p.value_mw:.1f}",
+                    f"{p.p90_mw:.1f}",
+                    f"{p.temperature_c:.1f}",
+                    f"{p.ghi_wm2:.0f}",
+                    f"{p.wind_speed_mps:.1f}",
+                    p.drivers,
+                )
+            tree.insert("", "end", values=values)  # type: ignore[attr-defined]
+
+    def _fill_forecast_metric_text(self, kind: str, result) -> None:
+        lines = ["══ 算法校验与日特性 ══════════════════════", f"最终模型：{result.model_name}", f"气候板块：{result.climate_block}", ""]
+        if result.algorithm_metrics:
+            lines.append("算法                     权重      MAE/MW    RMSE/MW   MAPE/%   状态")
+            for m in result.algorithm_metrics:
+                mae = "-" if not math.isfinite(m.mae_mw) else f"{m.mae_mw:.2f}"
+                rmse = "-" if not math.isfinite(m.rmse_mw) else f"{m.rmse_mw:.2f}"
+                mape = "-" if not math.isfinite(m.mape_pct) else f"{m.mape_pct:.2f}"
+                status = "可用" if m.available else "不可用"
+                if m.note:
+                    status += f"；{m.note}"
+                lines.append(f"{m.label:<22} {m.weight:7.3f}  {mae:>8}  {rmse:>8}  {mape:>7}  {status}")
+            lines.append("")
+        lines.append("日特性：")
+        for name, value in result.daily_stats:
+            if "率" in name or "因子" in name:
+                lines.append(f"  {name}: {value:.4f}")
+            else:
+                lines.append(f"  {name}: {value:.2f}")
+        self._set_text(self._forecast_widgets[kind]["metric_text"], "\n".join(lines))  # type: ignore[arg-type]
+
+    def _export_forecast_result(self, kind: str, fmt: str) -> None:
+        widgets = self._forecast_widgets.get(kind)
+        if not widgets:
+            return
+        result = widgets.get("last_result")
+        if result is None:
+            messagebox.showinfo("尚无结果", "请先执行预测，再导出结果。")
+            return
+        suffix = ".json" if fmt == "json" else ".csv"
+        filename = filedialog.asksaveasfilename(
+            title="导出预测结果",
+            defaultextension=suffix,
+            filetypes=[("JSON", "*.json")] if fmt == "json" else [("CSV", "*.csv")],
+            initialfile=f"{kind}_forecast_{datetime.now():%Y%m%d_%H%M%S}{suffix}",
+        )
+        if not filename:
+            return
+        try:
+            if fmt == "json":
+                export_forecast_result_json(result, filename)
+            else:
+                export_forecast_result_csv(result, filename)
+            messagebox.showinfo("导出完成", f"预测结果已导出：{filename}")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+
+    def _plot_day_ahead_forecast(self, kind: str, result) -> None:
+        widgets = self._forecast_widgets[kind]
+        fig = widgets["fig"]
+        fig.clear()
+        ax = fig.add_subplot(111)
+        fig.subplots_adjust(left=0.08, right=0.88, top=0.86, bottom=0.16)
+        widgets["ax"] = ax
+        x = [p.timestamp.hour + p.timestamp.minute / 60.0 for p in result.points]
+        values = [p.value_mw for p in result.points]
+        p10 = [p.p10_mw for p in result.points]
+        p90 = [p.p90_mw for p in result.points]
+        color = "#1f77b4" if kind == "load" else "#2ca02c"
+        ax.fill_between(x, p10, p90, color=color, alpha=0.18, label="P10-P90")
+        ax.plot(x, values, marker="o", markersize=3.2, color=color, linewidth=1.8, label="Forecast MW")
+        ax.set_title("负荷日前预测" if kind == "load" else "新能源日前预测（联动太阳几何/天气/POA）")
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("MW")
+        ticks = list(range(0, 25, 2))
+        ax.set_xticks(ticks)
+        ax.set_xlim(0, 24)
+        ax.grid(True, alpha=0.35)
+        if kind == "renewable" and any(getattr(p, "poa_wm2", 0.0) > 0.0 for p in result.points):
+            ax2 = ax.twinx()
+            poa = [p.poa_wm2 for p in result.points]
+            ghi = [p.ghi_wm2 for p in result.points]
+            ax2.plot(x, poa, color="#c0392b", linestyle="--", linewidth=1.5, label="POA W/m2")
+            ax2.plot(x, ghi, color="#f39c12", linestyle=":", linewidth=1.3, label="GHI W/m2")
+            ax2.set_ylabel("Irradiance / W/m2")
+            ax2.set_ylim(0, max(1000.0, max(poa + ghi) * 1.1))
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
+        else:
+            ax.legend(loc="best")
+        widgets["canvas"].draw()  # type: ignore[attr-defined]
+
+
     def _build_comtrade_tab(self) -> None:
         self._comtrade_record = None
         self._comtrade_popup = None
@@ -4572,7 +5414,9 @@ class ApproximationToolGUI(tk.Tk):
         self._comtrade_vertical_zoom = 1.0
         self._comtrade_visible_count = 6
         self._comtrade_channel_scroll = 0
-        self._comtrade_cursor_positions: dict[str, float | None] = {"T1": None, "T2": None}
+        self._comtrade_cursor_positions: dict[str, float | None] = {"T1": None}
+        self._comtrade_cursor_dragging = False
+        self._comtrade_cursor_refresh_after_id = None
         self._comtrade_is_syncing_view = False
         self._comtrade_xlimit_callback_registered = False
 
@@ -4652,9 +5496,8 @@ class ApproximationToolGUI(tk.Tk):
         ttk.Label(right, text="录波浏览区", style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.comtrade_time_label = ttk.Label(right, text="未加载文件")
         self.comtrade_time_label.grid(row=1, column=0, sticky="w", pady=(0, 2))
-        self.comtrade_cursor_label = tk.Text(right, height=4, wrap=tk.WORD)
-        self.comtrade_cursor_label.grid(row=5, column=0, sticky="ew", pady=(6, 0))
-        self.comtrade_cursor_label.insert("1.0", "光标：左键放置 T1，右键放置 T2。")
+        self.comtrade_cursor_label = tk.Text(right, height=1, wrap=tk.WORD)
+        self.comtrade_cursor_label.insert("1.0", "光标：左键点击曲线区放置游标，按住左键可连续拖拽。")
         self.comtrade_cursor_label.configure(state="disabled")
 
         self.comtrade_fig = Figure(figsize=(9.0, 6.2), dpi=100, facecolor="#101010")
@@ -4688,6 +5531,8 @@ class ApproximationToolGUI(tk.Tk):
         self._set_text(self.comtrade_info, "未加载录波文件。")
         self.comtrade_ax.callbacks.connect("xlim_changed", self._on_comtrade_axis_xlim_changed)
         self.comtrade_canvas.mpl_connect("button_press_event", self._on_comtrade_mouse_click)
+        self.comtrade_canvas.mpl_connect("motion_notify_event", self._on_comtrade_mouse_drag)
+        self.comtrade_canvas.mpl_connect("button_release_event", self._on_comtrade_mouse_release)
         self._comtrade_xlimit_callback_registered = True
         self.comtrade_canvas.draw()
 
@@ -4845,7 +5690,8 @@ class ApproximationToolGUI(tk.Tk):
         self._select_all_comtrade_channels()
         self._comtrade_vertical_zoom = 1.0
         self._comtrade_channel_scroll = 0
-        self._comtrade_cursor_positions = {"T1": None, "T2": None}
+        self._comtrade_cursor_positions = {"T1": None}
+        self._comtrade_cursor_dragging = False
         default_window = self._default_comtrade_window(record.duration_s)
         self._set_comtrade_time_entries(float(record.time_s[0]), float(record.time_s[0]) + default_window)
         self._comtrade_is_syncing_view = True
@@ -4918,76 +5764,91 @@ class ApproximationToolGUI(tk.Tk):
             idx -= 1
         return idx
 
+    def _clip_comtrade_cursor_x(self, x_value: float) -> float:
+        record = self._comtrade_record
+        if record is None or record.time_s.size == 0:
+            return float(x_value)
+        return float(np.clip(float(x_value), float(record.time_s[0]), float(record.time_s[-1])))
+
     def _current_comtrade_cursor_index(self, key: str) -> int | None:
         record = self._comtrade_record
-        frac = self._comtrade_cursor_positions.get(key)
-        if record is None or frac is None:
+        cursor_x = self._comtrade_cursor_positions.get(key)
+        if record is None or cursor_x is None:
             return None
-        start_s, end_s = self._current_comtrade_window()
-        x = start_s + frac * max(end_s - start_s, 0.0)
-        return self._nearest_comtrade_index(x)
+        return self._nearest_comtrade_index(cursor_x)
 
     def _current_comtrade_cursor_x(self, key: str) -> float | None:
-        frac = self._comtrade_cursor_positions.get(key)
-        if frac is None:
+        cursor_x = self._comtrade_cursor_positions.get(key)
+        if cursor_x is None:
             return None
-        start_s, end_s = self._current_comtrade_window()
-        return start_s + frac * max(end_s - start_s, 0.0)
+        return self._clip_comtrade_cursor_x(cursor_x)
 
     def _update_comtrade_cursor_label(self) -> None:
         record = self._comtrade_record
         if record is None:
-            self.comtrade_cursor_label.configure(state="normal")
-            self.comtrade_cursor_label.delete("1.0", tk.END)
-            self.comtrade_cursor_label.insert("1.0", "光标：左键放置 T1，右键放置 T2。")
-            self.comtrade_cursor_label.configure(state="disabled")
-            return
-        selection = self._selected_comtrade_indices() if self._comtrade_record is not None else []
-        lines = []
-        for key in ("T1", "T2"):
-            idx = self._current_comtrade_cursor_index(key)
-            if idx is None:
-                lines.append(f"{key}: 未设置")
-                continue
-            time_s = float(record.time_s[idx])
-            value_parts = []
-            for ch_idx in selection:
-                ch = record.analog_channels[ch_idx]
-                value_parts.append(f"{ch.name}={record.analog_values[idx, ch_idx]:.5g}{ch.unit or ''}")
-            lines.append(f"{key}: t={time_s:.6f}s, 点号={idx + 1}")
-            if value_parts:
-                chunk = 4
-                for pos in range(0, len(value_parts), chunk):
-                    prefix = "    " if pos == 0 else "    ↳ "
-                    lines.append(prefix + "；".join(value_parts[pos:pos + chunk]))
-        idx1 = self._current_comtrade_cursor_index("T1")
-        idx2 = self._current_comtrade_cursor_index("T2")
-        if idx1 is not None and idx2 is not None:
-            dt = float(record.time_s[idx2] - record.time_s[idx1])
-            ds = idx2 - idx1
-            lines.append(f"Δt = {dt:.6f} s，ΔN = {ds} 点")
+            text = "光标：左键点击曲线区放置游标，按住左键可连续拖拽。"
         else:
-            lines.append("提示：左键定位 T1，右键定位 T2；可用于故障前后对比和时间差测量。")
+            idx = self._current_comtrade_cursor_index("T1")
+            if idx is None:
+                text = "光标：左键点击曲线区放置游标，按住左键可连续拖拽。"
+            else:
+                text = f"游标：t={float(record.time_s[idx]):.6f}s，点号={idx + 1}。数值见曲线区游标右侧方框。"
         self.comtrade_cursor_label.configure(state="normal")
         self.comtrade_cursor_label.delete("1.0", tk.END)
-        self.comtrade_cursor_label.insert("1.0", "\n".join(lines))
+        self.comtrade_cursor_label.insert("1.0", text)
         self.comtrade_cursor_label.configure(state="disabled")
 
-    def _on_comtrade_mouse_click(self, event) -> None:
-        if event.inaxes is not self.comtrade_ax or event.xdata is None:
-            return
-        x0, x1 = self.comtrade_ax.get_xlim()
-        span = max(x1 - x0, 1e-12)
-        frac = min(1.0, max(0.0, (float(event.xdata) - x0) / span))
-        if event.button == 1:
-            self._comtrade_cursor_positions["T1"] = frac
-        elif event.button == 3:
-            self._comtrade_cursor_positions["T2"] = frac
-        else:
-            return
+    def _set_comtrade_cursor_from_x(self, x_value: float) -> None:
+        self._comtrade_cursor_positions["T1"] = self._clip_comtrade_cursor_x(x_value)
         self._update_comtrade_cursor_label()
+
+    def _comtrade_event_xdata(self, event) -> float | None:
+        if event.xdata is not None:
+            return float(event.xdata)
+        if event.x is None or event.y is None:
+            return None
+        try:
+            x_value, _y_value = self.comtrade_ax.transData.inverted().transform((event.x, event.y))
+        except Exception:
+            return None
+        return float(x_value)
+
+    def _schedule_comtrade_cursor_refresh(self) -> None:
+        if self._comtrade_cursor_refresh_after_id is not None:
+            return
+        self._comtrade_cursor_refresh_after_id = self.after_idle(self._flush_comtrade_cursor_refresh)
+
+    def _flush_comtrade_cursor_refresh(self) -> None:
+        self._comtrade_cursor_refresh_after_id = None
+        self._refresh_comtrade_plot(update_sequence=not self._comtrade_cursor_dragging)
+
+    def _on_comtrade_mouse_click(self, event) -> None:
+        if event.inaxes is not self.comtrade_ax or event.button != 1:
+            return
+        x_value = self._comtrade_event_xdata(event)
+        if x_value is None:
+            return
+        self._comtrade_cursor_dragging = True
+        self._set_comtrade_cursor_from_x(x_value)
         self._refresh_comtrade_plot()
-        self._refresh_sequence_analysis_window()
+
+    def _on_comtrade_mouse_drag(self, event) -> None:
+        if not self._comtrade_cursor_dragging:
+            return
+        x_value = self._comtrade_event_xdata(event)
+        if x_value is None:
+            return
+        self._set_comtrade_cursor_from_x(x_value)
+        self._schedule_comtrade_cursor_refresh()
+
+    def _on_comtrade_mouse_release(self, event) -> None:
+        if event.button != 1 or not self._comtrade_cursor_dragging:
+            return
+        self._comtrade_cursor_dragging = False
+        x_value = self._comtrade_event_xdata(event)
+        if x_value is not None:
+            self._set_comtrade_cursor_from_x(x_value)
+        self._schedule_comtrade_cursor_refresh()
 
     def _zoom_comtrade_vertical(self, factor: float) -> None:
         self._comtrade_vertical_zoom = min(6.0, max(0.25, self._comtrade_vertical_zoom * factor))
@@ -5063,15 +5924,79 @@ class ApproximationToolGUI(tk.Tk):
         self._set_comtrade_time_entries(start, start + width)
         self.comtrade_time_label.configure(text=f"当前时间窗：{start:.6f} s ~ {start + width:.6f} s")
 
-    def _refresh_comtrade_plot(self, from_scroll: bool = False) -> None:
+    def _add_comtrade_cursor_value_box(
+        self,
+        ax,
+        cursor_axis_frac: float,
+        draw_x: float,
+        cursor_idx: int,
+        visible_selection: list[int],
+        colors: list[str],
+    ) -> None:
+        record = self._comtrade_record
+        if record is None:
+            return
+        rows = [
+            TextArea(
+                f"游标  t={float(record.time_s[cursor_idx]):.6f}s  点号={cursor_idx + 1}",
+                textprops={"color": "#00ffff", "fontsize": 8, "weight": "bold"},
+            )
+        ]
+        for pos, ch_idx in enumerate(visible_selection):
+            ch = record.analog_channels[ch_idx]
+            color = colors[pos % len(colors)]
+            value = float(record.analog_values[cursor_idx, ch_idx])
+            unit = ch.unit or ""
+            swatch = DrawingArea(18, 10, 0, 0)
+            swatch.add_artist(Line2D([1, 17], [5, 5], color=color, linewidth=2.4))
+            value_text = TextArea(
+                f"{ch.name}: {value:.5g}{unit}",
+                textprops={"color": "#f3f3f3", "fontsize": 8},
+            )
+            rows.append(HPacker(children=[swatch, value_text], align="center", pad=0, sep=4))
+        box = VPacker(children=rows, align="left", pad=0, sep=2)
+        x_frac = min(0.78, max(0.03, cursor_axis_frac + 0.015))
+        y_frac = 0.86
+        value_box = AnnotationBbox(
+            box,
+            (x_frac, y_frac),
+            xycoords=ax.transAxes,
+            box_alignment=(0.0, 1.0),
+            frameon=True,
+            bboxprops={
+                "boxstyle": "round,pad=0.35",
+                "facecolor": "#101010",
+                "edgecolor": "#00ffff",
+                "linewidth": 0.9,
+                "alpha": 0.94,
+            },
+            annotation_clip=False,
+        )
+        ax.add_artist(value_box)
+        ax.text(
+            draw_x,
+            0.98,
+            "游标",
+            transform=ax.get_xaxis_transform(),
+            color="#00ffff",
+            fontsize=9,
+            ha="center",
+            va="top",
+            bbox=dict(facecolor="#101010", edgecolor="#00ffff", boxstyle="round,pad=0.2"),
+        )
+
+    def _refresh_comtrade_plot(self, from_scroll: bool = False, update_sequence: bool = True) -> None:
         record = self._comtrade_record
         ax = self.comtrade_ax
+        previous_sync_state = self._comtrade_is_syncing_view
+        self._comtrade_is_syncing_view = True
         ax.clear()
         self._style_comtrade_axis(ax)
         if record is None or record.analog_values.size == 0:
             ax.set_title("请先加载 COMTRADE 录波")
             ax.set_xlabel("t / s")
             self.comtrade_canvas.draw()
+            self._comtrade_is_syncing_view = previous_sync_state
             return
         selection = list(self.comtrade_channel_list.curselection())
         if not selection:
@@ -5094,13 +6019,13 @@ class ApproximationToolGUI(tk.Tk):
             ax.axhline(offset - 0.98, color="#0c8f0c", linewidth=0.6, alpha=0.8)
             ax.text(0.01, offset + 1.05, record.analog_channels[ch_idx].name, transform=ax.get_yaxis_transform(), color=color, fontsize=9, ha="left", va="bottom")
 
-        for key, color in (("T1", "#00ffff"), ("T2", "#ff7f00")):
-            frac = self._comtrade_cursor_positions.get(key)
-            if frac is None:
-                continue
-            draw_x = start_s + frac * max(end_s - start_s, 0.0)
-            ax.axvline(draw_x, color=color, linewidth=1.1, linestyle="--")
-            ax.text(draw_x, base_offset + 1.18, key, color=color, fontsize=9, ha="center", va="bottom", bbox=dict(facecolor="#101010", edgecolor=color, boxstyle="round,pad=0.2"))
+        cursor_x = self._current_comtrade_cursor_x("T1")
+        if cursor_x is not None and start_s <= cursor_x <= end_s:
+            cursor_axis_frac = (cursor_x - start_s) / max(end_s - start_s, 1e-12)
+            cursor_idx = self._current_comtrade_cursor_index("T1")
+            ax.axvline(cursor_x, color="#00ffff", linewidth=1.1, linestyle="--")
+            if cursor_idx is not None:
+                self._add_comtrade_cursor_value_box(ax, cursor_axis_frac, cursor_x, cursor_idx, visible_selection, colors)
 
         lower = -1.2
         upper = base_offset + 1.35
@@ -5113,11 +6038,11 @@ class ApproximationToolGUI(tk.Tk):
         self._set_comtrade_time_entries(start_s, end_s)
         self.comtrade_time_label.configure(text=f"当前时间窗：{start_s:.6f} s ~ {end_s:.6f} s，共 {len(record.time_s)} 点，{shown_text}")
         self._update_comtrade_cursor_label()
-        self._comtrade_is_syncing_view = True
         self.comtrade_fig.subplots_adjust(left=0.06, right=0.98, top=0.93, bottom=0.10)
         self.comtrade_canvas.draw()
-        self._comtrade_is_syncing_view = False
-        self._refresh_sequence_analysis_window()
+        self._comtrade_is_syncing_view = previous_sync_state
+        if update_sequence:
+            self._refresh_sequence_analysis_window()
         if self._comtrade_popup is not None and self._comtrade_popup.winfo_exists() and not from_scroll:
             self._draw_comtrade_overlay()
 
@@ -5175,9 +6100,15 @@ class ApproximationToolGUI(tk.Tk):
                 lines.append(f"Prony 类估计：{exc}")
             if len(selection) >= 3:
                 a, b, c = selection[:3]
-                seq = sequence_components(record.analog_values[idx, a], record.analog_values[idx, b], record.analog_values[idx, c])
+                seq = sequence_components(
+                    record.analog_values[idx, a],
+                    record.analog_values[idx, b],
+                    record.analog_values[idx, c],
+                    sample_rate_hz=sample_rate,
+                    fundamental_hz=fundamental,
+                )
                 lines.append("")
-                lines.append(f"序分量（按前三个选中通道 RMS 估计）：正序={seq.positive:.5g}，负序={seq.negative:.5g}，零序={seq.zero:.5g}，不平衡度={seq.unbalance_percent:.3f}%")
+                lines.append(f"序分量（按前三个选中通道的基波相量计算）：正序={seq.positive:.5g}，负序={seq.negative:.5g}，零序={seq.zero:.5g}，不平衡度={seq.unbalance_percent:.3f}%")
             else:
                 lines.append("")
                 lines.append("序分量提取：请选择至少 3 个相量/电流同类通道。")
