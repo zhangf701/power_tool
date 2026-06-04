@@ -14,8 +14,10 @@ from power_tool_forecast import (
     classify_climate_block,
     forecast_day_ahead,
     list_builtin_datasets,
+    list_forecast_algorithms,
     load_builtin_forecast_dataset,
     load_forecast_csv,
+    load_future_weather_csv,
     solar_day_profile,
     solar_irradiance_on_panel,
     solar_position,
@@ -31,9 +33,10 @@ def test_builtin_load_forecast_returns_24_hours() -> None:
         rows,
         ForecastConfig(kind="load", target_date=date(2025, 6, 22), latitude=34.05, longitude=-118.25, altitude_m=90),
     )
-    assert len(result.points) == 24
+    assert len(result.points) == 96
     assert result.points[0].timestamp.hour == 0
     assert result.points[-1].timestamp.hour == 23
+    assert result.points[-1].timestamp.minute == 45
     assert max(p.value_mw for p in result.points) > min(p.value_mw for p in result.points)
     assert "地中海" in result.climate_block
 
@@ -51,7 +54,7 @@ def test_builtin_renewable_forecast_is_capacity_limited() -> None:
             renewable_capacity_mw=5000,
         ),
     )
-    assert len(result.points) == 24
+    assert len(result.points) == 96
     assert all(0 <= p.value_mw <= 5000 for p in result.points)
     assert any(p.ghi_wm2 > 0 for p in result.points)
 
@@ -84,6 +87,82 @@ def test_caiso_opr_dt_and_hour_loader(tmp_path: Path) -> None:
     assert rows[0]["load_mw"] == 22000
 
 
+
+def test_future_weather_csv_drives_day_ahead_weather_features(tmp_path: Path) -> None:
+    path = tmp_path / "future_weather.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "hour", "temperature_c", "ghi_wm2", "wind_speed_mps"])
+        for hour_ending in range(1, 25):
+            writer.writerow(["2025-06-22", hour_ending, 33.0, 450.0 + hour_ending, 2.5])
+    weather_rows = load_future_weather_csv(path)
+    rows = load_builtin_forecast_dataset("CAISO_LOAD_SAMPLE")
+    result = forecast_day_ahead(
+        rows,
+        ForecastConfig(
+            kind="load",
+            target_date=date(2025, 6, 22),
+            latitude=34.05,
+            longitude=-118.25,
+            altitude_m=90,
+            future_weather_rows=tuple(weather_rows),
+            future_weather_source="future_weather.csv",
+        ),
+    )
+    assert len(weather_rows) == 24
+    assert result.points[0].temperature_c == 33.0
+    assert result.points[0].wind_speed_mps == 2.5
+    assert "未来天气=CSV" in result.points[0].drivers
+    assert "未来天气预报 CSV" in "\n".join(result.notes)
+
+
+def test_future_weather_csv_with_cloud_only_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "cloud_weather.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "cloud_cover_pct"])
+        for hour in range(24):
+            writer.writerow([f"2025-06-22 {hour:02d}:00", 80])
+    rows = load_future_weather_csv(path)
+    assert len(rows) == 24
+    assert rows[0]["cloud_cover_pct"] == 80
+
+def test_future_weather_csv_accepts_date_and_clock_time(tmp_path: Path) -> None:
+    path = tmp_path / "date_time_weather.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "time", "temperature_c"])
+        writer.writerow(["2025-06-22", "02:30", 21.5])
+    rows = load_future_weather_csv(path)
+    assert rows[0]["timestamp"].hour == 2
+    assert rows[0]["timestamp"].minute == 30
+    assert rows[0]["temperature_c"] == 21.5
+
+def test_imported_ghi_can_be_marked_as_weather_corrected() -> None:
+    ts = datetime(2025, 6, 22, 12, 0)
+    attenuated = solar_irradiance_on_panel(
+        ts,
+        35.37,
+        -119.02,
+        28.0,
+        weather_condition="overcast",
+        cloud_cover_pct=100.0,
+        input_ghi_wm2=500.0,
+        input_ghi_is_corrected=False,
+    )
+    imported = solar_irradiance_on_panel(
+        ts,
+        35.37,
+        -119.02,
+        28.0,
+        weather_condition="overcast",
+        cloud_cover_pct=100.0,
+        input_ghi_wm2=500.0,
+        input_ghi_is_corrected=True,
+    )
+    assert imported.corrected_ghi_wm2 == 500.0
+    assert attenuated.corrected_ghi_wm2 < imported.corrected_ghi_wm2
+
 def test_dataset_registry_and_climate_classification() -> None:
     load_names = {info.name for info in list_builtin_datasets("load")}
     renewable_names = {info.name for info in list_builtin_datasets("renewable")}
@@ -99,7 +178,7 @@ def test_missing_weather_is_inferred_from_history_and_geography() -> None:
         stripped,
         ForecastConfig(kind="load", target_date=date(2025, 6, 22), latitude=34.05, longitude=-118.25, altitude_m=90),
     )
-    assert len(result.points) == 24
+    assert len(result.points) == 96
     assert all(p.temperature_c == p.temperature_c for p in result.points)
     assert any(p.ghi_wm2 > 0 for p in result.points)
 
@@ -184,7 +263,7 @@ def test_chinese_and_baidu_kdd_schema_samples_parse() -> None:
         kdd_rows,
         ForecastConfig(kind="renewable", target_date=date(2025, 1, 22), latitude=41.0, longitude=115.0, renewable_resource="wind"),
     )
-    assert len(wind.points) == 24
+    assert len(wind.points) == 96
     assert any("资源=风电" in p.drivers for p in wind.points)
 
 
@@ -208,10 +287,18 @@ def test_solar_helper_reference_irradiance_is_zero_at_night() -> None:
 
 
 def test_forecast_config_defaults_to_nanjing_china() -> None:
+    from power_tool_forecast import load_forecast_builtin_config
+
     cfg = ForecastConfig(kind="renewable", target_date=date(2025, 6, 22))
+    defaults = load_forecast_builtin_config()["defaults"]
     assert abs(cfg.latitude - NANJING_LATITUDE) < 1e-9
     assert abs(cfg.longitude - NANJING_LONGITUDE) < 1e-9
     assert cfg.holiday_country == "CN"
+    assert cfg.interval_minutes == 15
+    assert cfg.algorithm == "adaptive_ensemble"
+    assert defaults["algorithm"] == "adaptive_ensemble"
+    assert defaults["interval_minutes"] == 15
+    assert "sklearn" in next(info.requires for info in list_forecast_algorithms("load") if info.code == "sklearn_auto")
 
 
 def test_weather_and_panel_orientation_reduce_or_change_poa() -> None:
@@ -237,3 +324,78 @@ def test_solar_forecast_is_linked_to_weather_and_panel_correction() -> None:
     assert max(p.poa_wm2 for p in clear.points) > max(p.poa_wm2 for p in cloudy.points)
     assert sum(p.value_mw for p in clear.points) > sum(p.value_mw for p in cloudy.points)
     assert any("POA=" in p.drivers and "光伏修正=" in p.drivers for p in clear.points)
+
+
+def test_annual_load_forecast_planning_sample() -> None:
+    from power_tool_forecast import (
+        AnnualLoadForecastConfig,
+        forecast_annual_load,
+        annual_seasonal_shapes_for_year,
+        format_annual_load_forecast_summary,
+        load_annual_load_sample,
+    )
+
+    dataset = load_annual_load_sample()
+    result = forecast_annual_load(dataset, AnnualLoadForecastConfig(horizon_years=12, algorithm="综合法"))
+    assert len(result.years) == 12
+    assert result.years[0].year == 2026
+    assert result.years[-1].energy_gwh > result.years[0].energy_gwh
+    assert result.years[-1].max_load_mw > result.years[0].max_load_mw
+    assert result.base_max_load_mw > 0
+    assert len(result.seasonal_shapes) == 4
+    assert all(len(shape.values_mw) == 24 for shape in result.seasonal_shapes)
+    base_shapes = annual_seasonal_shapes_for_year(result, result.base_year)
+    final_shapes = annual_seasonal_shapes_for_year(result, result.years[-1].year)
+    assert len(base_shapes) == len(final_shapes) == 4
+    assert max(base_shapes[0].values_mw) < max(final_shapes[0].values_mw)
+    assert "不包含空间负荷预测" in format_annual_load_forecast_summary(result)
+
+
+def test_forecast_interval_accepts_one_to_thirty_minutes_and_smooths() -> None:
+    rows = load_builtin_forecast_dataset("CAISO_LOAD_SAMPLE")
+    one_min = forecast_day_ahead(
+        rows,
+        ForecastConfig(kind="load", target_date=date(2025, 6, 22), latitude=34.05, longitude=-118.25, interval_minutes=1),
+    )
+    thirty_min = forecast_day_ahead(
+        rows,
+        ForecastConfig(kind="load", target_date=date(2025, 6, 22), latitude=34.05, longitude=-118.25, interval_minutes=30),
+    )
+    assert len(one_min.points) == 24 * 60
+    assert len(thirty_min.points) == 48
+    assert "线性插值" in "\n".join(one_min.notes)
+    assert max(p.value_mw for p in one_min.points) > min(p.value_mw for p in one_min.points)
+
+
+def test_forecast_interval_rejects_out_of_range() -> None:
+    rows = load_builtin_forecast_dataset("CAISO_LOAD_SAMPLE")
+    try:
+        forecast_day_ahead(rows, ForecastConfig(kind="load", target_date=date(2025, 6, 22), interval_minutes=31))
+    except ValueError as exc:
+        assert "1 到 30" in str(exc)
+    else:
+        raise AssertionError("interval above 30 minutes should be rejected")
+
+
+def test_annual_load_forecast_exports_json_and_csv(tmp_path: Path) -> None:
+    from power_tool_forecast import (
+        AnnualLoadForecastConfig,
+        annual_load_forecast_to_dict,
+        export_annual_load_forecast_csv,
+        export_annual_load_forecast_json,
+        forecast_annual_load,
+        load_annual_load_sample,
+    )
+
+    result = forecast_annual_load(load_annual_load_sample(), AnnualLoadForecastConfig(horizon_years=5))
+    data = annual_load_forecast_to_dict(result)
+    assert len(data["years"]) == 5
+    assert len(data["seasonal_shapes_by_year"]) == 6
+
+    json_path = export_annual_load_forecast_json(result, tmp_path / "annual.json")
+    csv_path = export_annual_load_forecast_csv(result, tmp_path / "annual.csv")
+    assert '"seasonal_shapes_by_year"' in json_path.read_text(encoding="utf-8")
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    assert "annual_years" in csv_text
+    assert "seasonal_shapes_by_year" in csv_text
+    assert "春季" in csv_text

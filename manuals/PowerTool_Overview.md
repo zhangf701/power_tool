@@ -4,15 +4,17 @@
 Click **Manual** in the `PowerTool AI` sidebar. The manual browser opens with the document for the current page preselected. You can switch to any other manual from the list on the left.
 
 ## 2. Document structure
-- Main-page manuals cover frequency dynamics, electromechanical oscillation, transient stability, small-signal analysis, loop closure, short-circuit calculation, and waveform viewing.
+- Main-page manuals cover waveform viewing, frequency dynamics, electromechanical oscillation, voltage/reactive-power analysis, transient stability, small-signal analysis, loop closure, short-circuit calculation, day-ahead/annual load forecasting, and renewable forecasting.
+- Topic manuals include **Forecasting Algorithms and Base Data Format**, which explains data requirements, algorithm principles, and applicability limits for day-ahead load, renewable, and annual load forecasts.
 - Subpage manuals cover the voltage/reactive-power pages and the parameter-validation subpages.
 - The files are stored in two parallel sets: English manuals use `PowerTool_*.md`, and Chinese manuals use `PowerTool_*_zh.md`.
 
 ## 3. Recommended reading order
 1. Read the purpose and applicability limits of the current page.
-2. Review the input definitions and the recommended workflow.
-3. Run one complete example and check the result interpretation section.
-4. Use the checklist and FAQ before exporting or acting on the conclusion.
+2. For forecasting pages, also read **Forecasting Algorithms and Base Data Format** before importing data; verify training columns, optional future-weather CSV, units, time resolution, and missing-value rules first.
+3. Review the input definitions and the recommended workflow.
+4. Run one complete example and check the result interpretation section.
+5. Use the checklist and FAQ before exporting or acting on the conclusion.
 
 ## 4. Positioning of the manuals
 These manuals guide engineering approximation studies inside PowerTool. They do not replace formal simulation reports, relay-setting documents, or grid-operation procedures.

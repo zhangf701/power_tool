@@ -4,7 +4,7 @@ These compact CSV files are bundled for offline demonstrations and automated tes
 
 The samples are small synthetic training slices shaped after public data schemas rather than complete operational records. Operators can replace them with actual CAISO OASIS, ERCOT, NYISO, PJM, NREL NSRDB/wind-toolkit, GEFCom, Baidu KDD Cup 2022/SDWPF, Southern Grid load-forecasting, or 电工杯-style files.
 
-When weather fields are missing, the tool infers temperature, GHI, and wind speed from historical same-hour medians and geography/climate baselines. Renewable forecasts are run as independent `solar` or `wind` jobs, not as an aggregate renewable target. Solar/PV forecasts apply a hard post-processing rule that sets output to zero whenever the solar altitude angle is below 0 degrees. Holiday calendars are built in for `US` and `CN`; edit `../forecast_holidays.json` or pass a custom `ForecastConfig.holiday_config_path` for other countries.
+When historical weather fields are missing, the tool infers temperature, GHI, and wind speed from historical same-hour medians and geography/climate baselines. The GUI can also import a separate future-weather forecast CSV for day-ahead load or renewable prediction. `future_weather_forecast_sample.csv` shows the hand-authored weather-only schema, and `future_weather_open_meteo_nanjing_sample.csv` is a real-source sample converted from the Open-Meteo Forecast API hourly CSV for Nanjing. Both use the PowerTool import columns: `timestamp`, `temperature_c`, `ghi_wm2`, `wind_speed_mps`, and `cloud_cover_pct`. Renewable forecasts are run as independent `solar` or `wind` jobs, not as an aggregate renewable target. Solar/PV forecasts apply a hard post-processing rule that sets output to zero whenever the solar altitude angle is below 0 degrees. Holiday calendars are built in for `US` and `CN`; edit `../forecast_holidays.json` or pass a custom `ForecastConfig.holiday_config_path` for other countries.
 
 Reference entry points used when designing the supported schema aliases:
 
@@ -17,3 +17,5 @@ Reference entry points used when designing the supported schema aliases:
 - 电工杯 load-forecasting schema references found during research were primarily third-party mirrors; the included file is therefore a parser-compatible schema sample, not a mirrored official dataset.
 
 See `dataset_catalog.json` for per-file reference metadata.
+
+For the full base-data schema, supported timestamp forms, algorithm descriptions, and applicability limits, see `../../manuals/PowerTool_Forecasting_Algorithms_and_Data_Format.md` and `../../manuals/PowerTool_Forecasting_Algorithms_and_Data_Format_zh.md`.

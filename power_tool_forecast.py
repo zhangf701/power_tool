@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import csv
-import importlib
-import importlib.util
 import json
 import math
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Sequence
+
+# Keep numerical backends lightweight for desktop use and CI test runs.
+for _thread_env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS"):
+    os.environ.setdefault(_thread_env_name, "1")
 
 import numpy as np
 
@@ -61,7 +64,7 @@ class ForecastConfig:
     renewable_resource: str = "solar"
     algorithm: str = "adaptive_ensemble"
     selected_algorithms: tuple[str, ...] | None = None
-    interval_minutes: int = 60
+    interval_minutes: int = 15
     horizon_hours: int = 24
     use_special_events: bool = True
     event_config_path: str | Path | None = None
@@ -73,6 +76,8 @@ class ForecastConfig:
     pv_albedo: float = 0.20
     pv_temp_coeff_pct_per_c: float = -0.35
     pv_noct_c: float = 45.0
+    future_weather_rows: Sequence[dict[str, float | datetime]] | None = None
+    future_weather_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,7 +121,7 @@ class ForecastResult:
     algorithm_metrics: tuple[ForecastAlgorithmMetric, ...] = ()
     daily_stats: tuple[tuple[str, float], ...] = ()
     algorithm_code: str = ""
-    interval_minutes: int = 60
+    interval_minutes: int = 15
 
 
 @dataclass(frozen=True)
@@ -272,21 +277,29 @@ _DEFAULT_FORECAST_BUILTIN_CONFIG: dict[str, object] = {
     "schema_version": "2026.06",
     "defaults": {
         "algorithm": "adaptive_ensemble",
-        "interval_minutes": 60,
+        "interval_minutes": 15,
         "horizon_hours": 24,
-        "ensemble_candidates": ["ridge", "huber", "hourly_analog", "exp_smoothing", "seasonal_naive"],
+        "ensemble_candidates": ["huber", "ridge", "hourly_analog", "exp_smoothing", "seasonal_naive"],
         "validation_min_points": 24,
         "validation_fraction": 0.20,
         "confidence_quantile": 0.80,
     },
     "algorithm_catalog": [
         {
+            "code": "sklearn_auto",
+            "label": "scikit-learn自动引擎",
+            "description": "可选 scikit-learn 树模型引擎；进入预测时延迟导入，并优先使用梯度提升树/随机森林。",
+            "supports": ["load", "renewable"],
+            "requires": ["sklearn"],
+            "priority": 60,
+        },
+        {
             "code": "adaptive_ensemble",
             "label": "自适应综合方案",
             "description": "对候选算法做滚动留出校验，按误差反比自动分配权重，形成综合预测方案。",
             "supports": ["load", "renewable"],
             "requires": [],
-            "priority": 10,
+            "priority": 5,
         },
         {
             "code": "ridge",
@@ -299,7 +312,7 @@ _DEFAULT_FORECAST_BUILTIN_CONFIG: dict[str, object] = {
         {
             "code": "huber",
             "label": "Huber鲁棒回归",
-            "description": "对异常点更稳健；安装 scikit-learn 时使用 HuberRegressor，否则退化为加权岭回归。",
+            "description": "对异常点更稳健；使用两阶段 Huber 权重岭回归，作为鲁棒基线。",
             "supports": ["load", "renewable"],
             "requires": [],
             "priority": 30,
@@ -331,7 +344,7 @@ _DEFAULT_FORECAST_BUILTIN_CONFIG: dict[str, object] = {
         {
             "code": "random_forest",
             "label": "随机森林",
-            "description": "安装 scikit-learn 时启用的非线性树模型，适合气象非线性较强场景。",
+            "description": "可选 scikit-learn 非线性树模型，适合气象非线性较强场景；进入预测时延迟导入。",
             "supports": ["load", "renewable"],
             "requires": ["sklearn"],
             "priority": 70,
@@ -339,7 +352,7 @@ _DEFAULT_FORECAST_BUILTIN_CONFIG: dict[str, object] = {
         {
             "code": "gradient_boosting",
             "label": "梯度提升树",
-            "description": "安装 scikit-learn 时启用的提升树模型，适合小样本非线性拟合对比。",
+            "description": "可选 scikit-learn 提升树模型，适合小样本非线性拟合对比；进入预测时延迟导入。",
             "supports": ["load", "renewable"],
             "requires": ["sklearn"],
             "priority": 80,
@@ -410,7 +423,8 @@ _COLUMN_ALIASES = {
     "wind_mw": {"wind_mw", "wind", "wind_power_mw", "patv", "active_power", "风电", "风电功率", "风电出力", "实际功率"},
     "temperature_c": {"temperature_c", "temp_c", "temperature", "dry_bulb_c", "t", "气温", "温度", "环境温度"},
     "ghi_wm2": {"ghi_wm2", "ghi", "global_horizontal_irradiance", "solar_irradiance", "辐照度", "总辐照", "水平辐照"},
-    "wind_speed_mps": {"wind_speed_mps", "wind_speed", "ws_mps", "windspeed", "wspd", "风速"},
+    "wind_speed_mps": {"wind_speed_mps", "wind_speed", "ws_mps", "windspeed", "wspd", "wind_mps", "风速"},
+    "cloud_cover_pct": {"cloud_cover_pct", "cloud_cover", "cloud", "cloud_pct", "clouds", "total_cloud_cover", "云量", "云覆盖率"},
 }
 
 
@@ -584,6 +598,79 @@ def _safe_float_value(value: str | None, default: float = float("nan")) -> float
     return float(str(value).replace(",", ""))
 
 
+def _parse_intraday_minutes(value: str | float | int | None) -> float:
+    """Parse a minute offset, HH:MM clock, or decimal hour into minutes after midnight."""
+    if value is None:
+        return float("nan")
+    text = str(value).strip()
+    if not text:
+        return float("nan")
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) < 2:
+            return float("nan")
+        hour = int(float(parts[0]))
+        minute = int(float(parts[1]))
+        second = float(parts[2]) if len(parts) >= 3 else 0.0
+        return hour * 60.0 + minute + second / 60.0
+    return float(text.replace(",", ""))
+
+
+def _row_from_mapped_forecast_csv(raw: dict[str, str], mapping: dict[str, str | None]) -> dict[str, float | datetime]:
+    """Map one CSV row to canonical fields and compose common timestamp layouts. / 映射一行 CSV 并组合常见日期+时刻格式。"""
+    item: dict[str, float | datetime] = {}
+    timestamp_base: datetime | None = None
+    timestamp_full: datetime | None = None
+    minute_hint: float | None = None
+
+    for original, canonical in mapping.items():
+        if canonical is None:
+            continue
+        text = str(raw.get(original, "") or "").strip()
+        if canonical == "timestamp":
+            if not text:
+                continue
+            try:
+                parsed = _parse_timestamp(text)
+                if parsed.time() != datetime.min.time() or "T" in text or ":" in text:
+                    timestamp_full = parsed
+                else:
+                    timestamp_base = parsed
+            except ValueError:
+                try:
+                    minute_hint = _parse_intraday_minutes(text)
+                except Exception:
+                    raise ValueError(f"无法解析时间列 {original}: {text}")
+        elif canonical == "minute_offset":
+            item[canonical] = _parse_intraday_minutes(text)
+        else:
+            item[canonical] = _safe_float_value(text)
+
+    if timestamp_full is not None:
+        item["timestamp"] = timestamp_full
+    elif timestamp_base is not None and minute_hint is not None and math.isfinite(minute_hint):
+        item["timestamp"] = timestamp_base.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=float(minute_hint))
+    elif timestamp_base is not None:
+        item["timestamp"] = timestamp_base
+
+    if "timestamp" not in item and "day_index" in item and "minute_offset" in item:
+        day = int(item.pop("day_index"))
+        minute_offset = float(item.pop("minute_offset"))
+        item["timestamp"] = datetime(2025, 1, 1) + timedelta(days=max(day - 1, 0), minutes=minute_offset)
+    if "timestamp" in item and "minute_offset" in item and isinstance(item["timestamp"], datetime):
+        minute_offset = float(item.pop("minute_offset"))
+        item["timestamp"] = item["timestamp"].replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=minute_offset)
+    if "timestamp" in item and "interval_index" in item and isinstance(item["timestamp"], datetime):
+        idx = int(item.pop("interval_index"))
+        idx0 = max(0, idx - 1) if idx >= 1 else max(0, idx)
+        item["timestamp"] = item["timestamp"].replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=15 * idx0)
+    if "timestamp" in item and "hour" in item and isinstance(item["timestamp"], datetime):
+        hour = int(item.pop("hour"))
+        hour = hour - 1 if 1 <= hour <= 24 else hour
+        item["timestamp"] = item["timestamp"].replace(hour=max(0, min(23, hour)), minute=0, second=0, microsecond=0)
+    return item
+
+
 def load_forecast_csv(path: str | Path, kind: str = "load") -> list[dict[str, float | datetime]]:
     source = Path(path)
     with source.open("r", encoding="utf-8-sig", newline="") as f:
@@ -596,29 +683,7 @@ def load_forecast_csv(path: str | Path, kind: str = "load") -> list[dict[str, fl
             raise ValueError("CSV 需要 timestamp/time/datetime/date_time 等时间列，或 Day + Tmstamp 组合列。")
         rows: list[dict[str, float | datetime]] = []
         for raw in reader:
-            item: dict[str, float | datetime] = {}
-            for original, canonical in mapping.items():
-                if canonical is None:
-                    continue
-                if canonical == "timestamp":
-                    item[canonical] = _parse_timestamp(raw.get(original, ""))
-                else:
-                    item[canonical] = _safe_float_value(raw.get(original))
-            if "timestamp" not in item and "day_index" in item and "minute_offset" in item:
-                day = int(item.pop("day_index"))
-                minute_offset = int(item.pop("minute_offset"))
-                item["timestamp"] = datetime(2025, 1, 1) + timedelta(days=max(day - 1, 0), minutes=minute_offset)
-            if "timestamp" in item and "minute_offset" in item and isinstance(item["timestamp"], datetime):
-                minute_offset = int(item.pop("minute_offset"))
-                item["timestamp"] = item["timestamp"].replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=minute_offset)
-            if "timestamp" in item and "interval_index" in item and isinstance(item["timestamp"], datetime):
-                idx = int(item.pop("interval_index"))
-                idx0 = max(0, idx - 1) if idx >= 1 else max(0, idx)
-                item["timestamp"] = item["timestamp"].replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=15 * idx0)
-            if "timestamp" in item and "hour" in item and isinstance(item["timestamp"], datetime):
-                hour = int(item.pop("hour"))
-                hour = hour - 1 if 1 <= hour <= 24 else hour
-                item["timestamp"] = item["timestamp"].replace(hour=max(0, min(23, hour)), minute=0, second=0, microsecond=0)
+            item = _row_from_mapped_forecast_csv(raw, mapping)
             if kind == "renewable" and "renewable_mw" not in item:
                 solar = float(item.get("solar_mw", 0.0) or 0.0)
                 wind = float(item.get("wind_mw", 0.0) or 0.0)
@@ -627,6 +692,46 @@ def load_forecast_csv(path: str | Path, kind: str = "load") -> list[dict[str, fl
     rows.sort(key=lambda r: r["timestamp"])  # type: ignore[index]
     if len(rows) < 48:
         raise ValueError("至少需要 48 个小时点用于日前预测。")
+    return rows
+
+
+def load_future_weather_csv(path: str | Path) -> list[dict[str, float | datetime]]:
+    """Load future weather forecast rows used by day-ahead forecasting. / 导入未来天气预报 CSV。
+
+    Required: a timestamp column or date + time/hour/period columns.  At least one
+    weather driver must be present: temperature_c, ghi_wm2, wind_speed_mps, or
+    cloud_cover_pct. Target columns such as load_mw or solar_mw are ignored.
+    """
+    source = Path(path)
+    with source.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("天气 CSV 缺少表头。")
+        mapping = {name: _canonical_header(name) for name in reader.fieldnames}
+        mapped_values = set(mapping.values())
+        if "timestamp" not in mapped_values and not ({"day_index", "minute_offset"} <= mapped_values):
+            raise ValueError("天气 CSV 需要 timestamp/time/datetime/date_time 等时间列，或 date+hour、date+时刻、Day+Tmstamp 组合列。")
+        weather_keys = {"temperature_c", "ghi_wm2", "wind_speed_mps", "cloud_cover_pct"}
+        if not (weather_keys & mapped_values):
+            raise ValueError("天气 CSV 至少需要 temperature_c/temp_c/气温、ghi_wm2/GHI/辐照度、wind_speed_mps/Wspd/风速 或 cloud_cover_pct/云量 中的一个字段。")
+        rows: list[dict[str, float | datetime]] = []
+        for raw in reader:
+            item = _row_from_mapped_forecast_csv(raw, mapping)
+            ts = item.get("timestamp")
+            if not isinstance(ts, datetime):
+                continue
+            has_weather = False
+            for key in tuple(item.keys()):
+                if key in weather_keys and math.isfinite(_finite_float(item.get(key))):
+                    has_weather = True
+                elif key not in weather_keys and key != "timestamp":
+                    # Future-weather files may contain target columns for reference; keep only drivers.
+                    item.pop(key, None)
+            if has_weather:
+                rows.append(item)
+    rows.sort(key=lambda r: r["timestamp"])  # type: ignore[index]
+    if not rows:
+        raise ValueError("天气 CSV 没有可用的未来气象记录。")
     return rows
 
 
@@ -888,6 +993,7 @@ def solar_irradiance_on_panel(
     temp_coeff_pct_per_c: float = -0.35,
     noct_c: float = 45.0,
     input_ghi_wm2: float | None = None,
+    input_ghi_is_corrected: bool = False,
 ) -> SolarIrradianceResult:
     """Compute weather-corrected horizontal and tilted-plane irradiance for PV studies.
 
@@ -902,6 +1008,11 @@ def solar_irradiance_on_panel(
     clear_ghi = max(0.0, pos.clear_sky_ghi_wm2)
     if input_ghi_wm2 is None or not math.isfinite(float(input_ghi_wm2)):
         corrected_ghi = clear_ghi * weather_factor
+    elif input_ghi_is_corrected:
+        # The caller has already applied the weather/scenario correction to the
+        # supplied GHI. Keep weather_factor in the returned diagnostics, but do
+        # not attenuate the irradiance a second time.
+        corrected_ghi = max(0.0, float(input_ghi_wm2))
     else:
         # Treat provided GHI as the baseline weather expectation and still allow user correction.
         corrected_ghi = max(0.0, float(input_ghi_wm2)) * weather_factor
@@ -1118,26 +1229,107 @@ def _rows_to_features(
 
 def _future_grid(config: ForecastConfig) -> list[datetime]:
     interval = int(config.interval_minutes)
-    if interval not in {5, 10, 15, 30, 60}:
-        raise ValueError("时段间隔仅支持 5、10、15、30 或 60 分钟。")
+    if interval < 1 or interval > 30:
+        raise ValueError("时段间隔需为 1 到 30 分钟之间的整数。")
     if config.horizon_hours <= 0:
         raise ValueError("预测时长必须大于 0。")
-    n_points = int(round(config.horizon_hours * 60 / interval))
-    return [datetime.combine(config.target_date, datetime.min.time()) + timedelta(minutes=interval * i) for i in range(n_points)]
+    total_minutes = int(round(config.horizon_hours * 60))
+    n_points = int(math.ceil(total_minutes / interval))
+    start = datetime.combine(config.target_date, datetime.min.time())
+    return [start + timedelta(minutes=interval * i) for i in range(n_points) if interval * i < total_minutes]
+
+
+def _future_weather_value(rows: Sequence[dict[str, float | datetime]] | None, key: str, ts: datetime, max_gap_hours: float = 6.0) -> float | None:
+    if not rows:
+        return None
+    samples: list[tuple[datetime, float]] = []
+    for row in rows:
+        rts = row.get("timestamp")
+        value = _finite_float(row.get(key))
+        if isinstance(rts, datetime) and math.isfinite(value):
+            samples.append((rts.replace(second=0, microsecond=0), float(value)))
+    if not samples:
+        return None
+    samples.sort(key=lambda item: item[0])
+    target = ts.replace(second=0, microsecond=0)
+    max_gap = max_gap_hours * 3600.0
+    before: tuple[datetime, float] | None = None
+    after: tuple[datetime, float] | None = None
+    for sample in samples:
+        if sample[0] == target:
+            return sample[1]
+        if sample[0] < target:
+            before = sample
+        elif sample[0] > target:
+            after = sample
+            break
+    if before is not None and after is not None:
+        left_s = (target - before[0]).total_seconds()
+        right_s = (after[0] - target).total_seconds()
+        span_s = (after[0] - before[0]).total_seconds()
+        if span_s > 0.0 and max(left_s, right_s) <= max_gap:
+            ratio = left_s / span_s
+            return float(before[1] + ratio * (after[1] - before[1]))
+        return before[1] if left_s <= right_s and left_s <= max_gap else after[1] if right_s <= max_gap else None
+    if before is not None and (target - before[0]).total_seconds() <= max_gap:
+        return before[1]
+    if after is not None and (after[0] - target).total_seconds() <= max_gap:
+        return after[1]
+    return None
+
+
+def _future_weather_irradiance_supplied(rows: Sequence[dict[str, float | datetime]] | None, ts: datetime) -> bool:
+    """Whether the future-weather file already supplies irradiance information for this timestamp. / 判断天气文件是否已给出该时刻辐照信息。"""
+    if not rows:
+        return False
+    return (
+        _future_weather_value(rows, "ghi_wm2", ts) is not None
+        or _future_weather_value(rows, "cloud_cover_pct", ts) is not None
+    )
+
+
+def _future_weather_override(
+    history: list[dict[str, float | datetime]],
+    ts: datetime,
+    config: ForecastConfig,
+    climate: str,
+) -> tuple[float, float, float]:
+    temp, ghi, wind = _inferred_weather(history, ts, config, climate)
+    future_rows = config.future_weather_rows
+    if not future_rows:
+        return temp, ghi, wind
+    temp_csv = _future_weather_value(future_rows, "temperature_c", ts)
+    ghi_csv = _future_weather_value(future_rows, "ghi_wm2", ts)
+    wind_csv = _future_weather_value(future_rows, "wind_speed_mps", ts)
+    cloud_csv = _future_weather_value(future_rows, "cloud_cover_pct", ts)
+    if temp_csv is not None:
+        temp = temp_csv
+    if ghi_csv is not None:
+        ghi = max(0.0, ghi_csv)
+    elif cloud_csv is not None:
+        # Cloud-only weather forecasts do not supply irradiance. Use the existing
+        # inferred GHI as the clear/typical baseline and attenuate it with the
+        # forecast cloud cover. The resulting GHI is then treated as the already
+        # weather-corrected forecast expectation to avoid double attenuation.
+        ghi = max(0.0, ghi * solar_weather_factor("clear", cloud_csv, 1.0))
+    if wind_csv is not None:
+        wind = max(0.0, wind_csv)
+    return float(temp), max(0.0, float(ghi)), max(0.0, float(wind))
 
 
 def _future_features(times: Sequence[datetime], history: list[dict[str, float | datetime]], config: ForecastConfig, climate: str) -> tuple[np.ndarray, list[tuple[float, float, float]]]:
     future_weather: list[tuple[float, float, float]] = []
     solar_resource = config.kind == "renewable" and _renewable_resource(config) == "solar"
     for ts in times:
-        temp, ghi, wind = _inferred_weather(history, ts, config, climate)
+        temp, ghi, wind = _future_weather_override(history, ts, config, climate)
         if solar_resource:
             irr = solar_irradiance_on_panel(
                 ts, config.latitude, config.longitude, temp,
                 config.weather_condition, config.cloud_cover_pct, config.irradiance_adjustment,
                 config.pv_tilt_deg, config.pv_azimuth_deg, config.pv_albedo,
                 config.pv_temp_coeff_pct_per_c, config.pv_noct_c,
-                input_ghi_wm2=None,
+                input_ghi_wm2=ghi,
+                input_ghi_is_corrected=_future_weather_irradiance_supplied(config.future_weather_rows, ts),
             )
             ghi = irr.corrected_ghi_wm2
         future_weather.append((float(temp), float(ghi), float(wind)))
@@ -1183,19 +1375,19 @@ def _huber_values(x_train: np.ndarray, y_train: np.ndarray, x_future: np.ndarray
     return _weighted_ridge_values(x_train, y_train, x_future, weights), "两阶段Huber权重岭回归。"
 
 def _sklearn_tree_values(code: str, x_train: np.ndarray, y_train: np.ndarray, x_future: np.ndarray) -> tuple[np.ndarray | None, str]:
-    if importlib.util.find_spec("sklearn") is None:
-        return None, "未安装 scikit-learn，树模型不可用。"
     try:
+        # Import scikit-learn lazily so non-forecast pages and lightweight scripts
+        # can start without paying the tree-model import cost.
+        from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+
         if code == "random_forest":
-            ensemble = importlib.import_module("sklearn.ensemble")
-            model = ensemble.RandomForestRegressor(n_estimators=32, max_depth=7, min_samples_leaf=2, random_state=42, n_jobs=1)
+            model = RandomForestRegressor(n_estimators=12, max_depth=6, min_samples_leaf=2, random_state=42, n_jobs=1)
         else:
-            ensemble = importlib.import_module("sklearn.ensemble")
-            model = ensemble.GradientBoostingRegressor(n_estimators=60, max_depth=3, learning_rate=0.06, random_state=42)
+            model = GradientBoostingRegressor(n_estimators=24, max_depth=2, learning_rate=0.08, random_state=42)
         model.fit(x_train, y_train)
         return np.asarray(model.predict(x_future), dtype=float), ""
-    except Exception as exc:  # pragma: no cover - sklearn version details vary
-        return None, f"树模型调用失败：{exc}"
+    except Exception as exc:  # pragma: no cover - sklearn installation/version details vary
+        return None, f"scikit-learn 树模型调用失败：{exc}"
 
 
 def _slot_key(ts: datetime) -> tuple[int, int]:
@@ -1316,6 +1508,12 @@ def _predict_algorithm(
         x_future, _fw = _future_features(future_times, rows_train, config, climate)
     if y_train.size == 0:
         return np.zeros(len(future_times), dtype=float), False, "训练样本为空。"
+    if code == "sklearn_auto":
+        for sklearn_code in ("gradient_boosting", "random_forest"):
+            values, note = _sklearn_tree_values(sklearn_code, x_train, y_train, x_future)
+            if values is not None:
+                return values, True, f"默认 scikit-learn 引擎：{forecast_algorithm_label(sklearn_code)}。" + (f" {note}" if note else "")
+        return np.zeros(len(future_times), dtype=float), False, "scikit-learn 自动引擎未能完成梯度提升树或随机森林训练。"
     if code in {"ridge", "adaptive_ridge"}:
         return _ridge_values(x_train, y_train, x_future), True, ""
     if code == "huber":
@@ -1366,10 +1564,17 @@ def _candidate_algorithms(config: ForecastConfig) -> list[str]:
         return [str(code) for code in config.selected_algorithms]
     cfg = load_forecast_builtin_config()
     defaults = cfg.get("defaults", {}) if isinstance(cfg.get("defaults"), dict) else {}
-    candidates = defaults.get("ensemble_candidates", ["ridge", "huber", "hourly_analog", "exp_smoothing", "seasonal_naive"])
+    fallback_candidates = ["huber", "ridge", "hourly_analog", "exp_smoothing", "seasonal_naive"]
+    candidates = defaults.get("ensemble_candidates", fallback_candidates)
     if not isinstance(candidates, list):
-        candidates = ["ridge", "huber", "hourly_analog", "exp_smoothing", "seasonal_naive"]
-    return [str(code) for code in candidates if str(code) != "adaptive_ensemble"]
+        candidates = fallback_candidates
+    candidate_codes = [str(code) for code in candidates if str(code) != "adaptive_ensemble"]
+    if int(config.interval_minutes) < 5:
+        # Very high-resolution outputs are interpolated and smoothed after the
+        # model run.  Keep the validation suite compact to avoid spending most
+        # of the desktop runtime on analog lookup for every minute of the day.
+        candidate_codes = [code for code in candidate_codes if code not in {"hourly_analog"}]
+    return candidate_codes
 
 
 def _run_algorithm_suite(
@@ -1496,7 +1701,8 @@ def _solar_physical_correction(
             config.weather_condition, config.cloud_cover_pct, config.irradiance_adjustment,
             config.pv_tilt_deg, config.pv_azimuth_deg, config.pv_albedo,
             config.pv_temp_coeff_pct_per_c, config.pv_noct_c,
-            input_ghi_wm2=None,
+            input_ghi_wm2=weather[1],
+            input_ghi_is_corrected=True,
         )
         irradiance_rows.append(irr)
         if irr.position.altitude_deg <= 0.0:
@@ -1598,6 +1804,45 @@ def _daily_stats(
     return tuple(stats)
 
 
+def _interpolate_and_smooth_forecast(forecast: np.ndarray, config: ForecastConfig) -> np.ndarray:
+    """Apply sub-hour interpolation and light curve smoothing for high-resolution outputs."""
+    values = np.asarray(forecast, dtype=float)
+    n = values.size
+    if n < 3:
+        return values
+    interval = max(1, int(config.interval_minutes))
+    adjusted = values.copy()
+
+    # For 1–29 minute outputs, use 30-minute anchor points and linearly
+    # interpolate back to the user-selected grid.  This avoids stair-step
+    # behavior when historical samples are hourly or half-hourly.
+    if interval < 30:
+        anchor_step = max(1, int(round(30.0 / interval)))
+        if anchor_step > 1 and n > anchor_step:
+            x = np.arange(n, dtype=float)
+            anchors = np.arange(0, n, anchor_step, dtype=int)
+            if anchors[-1] != n - 1:
+                anchors = np.append(anchors, n - 1)
+            interpolated = np.interp(x, anchors.astype(float), adjusted[anchors])
+            adjusted = 0.35 * adjusted + 0.65 * interpolated
+
+    # Triangular smoothing keeps day-ahead and renewable curves readable while
+    # retaining most of the model signal.  Physical renewable limits are applied
+    # again after smoothing in the main workflow.
+    window = max(3, int(round(30.0 / interval)) + 1)
+    if window % 2 == 0:
+        window += 1
+    window = min(window, n if n % 2 == 1 else n - 1)
+    if window >= 3:
+        half = window // 2
+        weights = np.asarray([half + 1 - abs(i - half) for i in range(window)], dtype=float)
+        weights /= float(np.sum(weights))
+        padded = np.pad(adjusted, (half, half), mode="edge")
+        smoothed = np.convolve(padded, weights, mode="valid")
+        adjusted = 0.25 * values + 0.75 * smoothed
+    return np.maximum(adjusted, 0.0)
+
+
 def forecast_day_ahead(rows: Iterable[dict[str, float | datetime]], config: ForecastConfig) -> ForecastResult:
     history = sorted(list(rows), key=lambda r: r["timestamp"])  # type: ignore[index]
     if len(history) < 48:
@@ -1613,6 +1858,7 @@ def forecast_day_ahead(rows: Iterable[dict[str, float | datetime]], config: Fore
     forecast, solar_irradiance_rows = _solar_physical_correction(forecast, future_times, future_weather, config, renewable_resource)
     forecast = _apply_renewable_limits(forecast, future_times, config, renewable_resource)
     forecast, applied_events = _apply_special_events(forecast, future_times, config, renewable_resource)
+    forecast = _interpolate_and_smooth_forecast(forecast, config)
     forecast = _apply_renewable_limits(forecast, future_times, config, renewable_resource)
     mae = float(np.mean(np.abs(residual))) if residual.size else 0.0
     cfg = load_forecast_builtin_config()
@@ -1641,7 +1887,8 @@ def forecast_day_ahead(rows: Iterable[dict[str, float | datetime]], config: Fore
             p90 = 0.0
         holiday_text = '节假日' if _is_holiday(ts.date(), config.holiday_country, config.holiday_config_path) else '工作日' if ts.weekday() < 5 else '周末'
         resource_text = f"，资源={'光伏' if renewable_resource == 'solar' else '风电'}" if config.kind == "renewable" else ""
-        driver = f"星期{ts.weekday()+1}/{holiday_text}，{climate}{resource_text}，T={temp:.1f}℃，GHI={ghi:.0f}W/m2，风={wind:.1f}m/s"
+        weather_source_text = "，未来天气=CSV" if config.future_weather_rows else ""
+        driver = f"星期{ts.weekday()+1}/{holiday_text}，{climate}{resource_text}{weather_source_text}，T={temp:.1f}℃，GHI={ghi:.0f}W/m2，风={wind:.1f}m/s"
         if solar_irr is not None:
             driver += f"，太阳高={solar_alt:.1f}°，方位={solar_az:.0f}°，POA={poa:.0f}W/m2，入射角={incidence:.1f}°，天气系数={weather_factor:.2f}，光伏修正={pv_power_factor:.2f}"
         if applied_events:
@@ -1655,13 +1902,21 @@ def forecast_day_ahead(rows: Iterable[dict[str, float | datetime]], config: Fore
     notes = [
         f"日前 {config.horizon_hours} 小时、{len(points)} 点预测；时段间隔 {config.interval_minutes} 分钟。",
         "特征已包含小时、星期、节假日、南北半球季节项、经纬度、海拔、太阳高度角、太阳方位角、组件倾斜面辐照度 POA 和气候板块。",
-        "缺失气象数据时会优先使用历史同小时/同刻气候值，并用经纬度、海拔和气候板块估算温度/GHI/风速；光伏未来 GHI 会继续叠加用户天气场景修正。",
+        "缺失气象数据时会优先使用历史同小时/同刻气候值，并用经纬度、海拔和气候板块估算温度/GHI/风速；若导入未来天气 CSV，则同时间戳温度、GHI、风速会优先覆盖历史推断值。",
+        "默认引擎为自适应综合方案；scikit-learn 树模型作为可选算法在进入预测时延迟导入。",
         "算法可由用户选择；自适应综合方案会对候选模型做留出校验，并按误差反比分配权重。",
+        "1–30 分钟时间颗粒度均支持；高分辨率输出会基于 30 分钟锚点做线性插值，并进行轻量曲线平滑。",
         "新能源预测仅支持风电与光伏两类独立资源；光伏资源已联动太阳位置、天气修正、组件倾角/方位角、POA 辐照度和组件温度系数，夜间仍强制清零。",
         "节假日内置中国和美国；其它国家/地区可通过 data/forecast_holidays.json 或 ForecastConfig.holiday_config_path 扩展。",
         "特殊事件修正可通过 data/forecast_builtin_config.json 开启，支持绝对 MW 和相对比例修正。",
         "可直接导入 CAISO/NYISO/ERCOT/PJM/GEFCom/NREL 风格 CSV；表头会自动映射常见字段，并兼容中文日期/时刻/负荷字段。",
+        "未来天气预报 CSV 可独立导入；支持 timestamp/date+hour/date+time/date+时刻 与 temperature_c、ghi_wm2、wind_speed_mps、cloud_cover_pct 等字段，小时级天气会对高分辨率预测点线性插值。",
     ]
+    if config.future_weather_rows:
+        source_name = config.future_weather_source or "外部未来天气 CSV"
+        notes.insert(2, f"未来天气 CSV 已导入：{source_name}；温度/GHI/风速按时间戳映射到预测网格，时段不一致时采用线性插值，缺失字段仍回退为历史同刻与地理气候估计。")
+        if config.kind == "renewable" and renewable_resource == "solar" and any(_future_weather_value(config.future_weather_rows, "ghi_wm2", p.timestamp) is not None for p in points):
+            notes.insert(3, "光伏预测中，如果未来天气 CSV 已提供 GHI，则该 GHI 被视为外部天气预报基线，不再叠加界面天气场景系数，避免重复折减。")
     return ForecastResult(config.kind, climate, model_name, mae, tuple(points), tuple(notes), metrics, stats, algorithm_code, config.interval_minutes)
 
 
@@ -1772,3 +2027,312 @@ def export_forecast_result_csv(result: ForecastResult, path: str | Path) -> Path
         for p in result.points:
             writer.writerow([p.timestamp.isoformat(sep=" "), f"{p.value_mw:.6g}", f"{p.p10_mw:.6g}", f"{p.p90_mw:.6g}", f"{p.temperature_c:.6g}", f"{p.ghi_wm2:.6g}", f"{p.poa_wm2:.6g}", f"{p.solar_altitude_deg:.6g}", f"{p.solar_azimuth_deg:.6g}", f"{p.incidence_angle_deg:.6g}", f"{p.weather_factor:.6g}", f"{p.pv_power_factor:.6g}", f"{p.wind_speed_mps:.6g}", p.drivers])
     return target
+
+ANNUAL_LOAD_SAMPLE_PATH = Path(__file__).resolve().parent / "data" / "annual_load_forecast_sample.json"
+
+
+@dataclass(frozen=True)
+class AnnualLoadHistoryPoint:
+    year: int
+    energy_gwh: float
+    max_load_mw: float
+    gdp_billion: float
+    population_million: float
+    primary_gdp_billion: float = 0.0
+    secondary_gdp_billion: float = 0.0
+    tertiary_gdp_billion: float = 0.0
+
+
+@dataclass(frozen=True)
+class AnnualLoadForecastConfig:
+    horizon_years: int = 10
+    latitude: float = NANJING_LATITUDE
+    longitude: float = NANJING_LONGITUDE
+    climate_block: str = ""
+    algorithm: str = "综合法"
+    gdp_growth_pct: float = 5.0
+    population_growth_pct: float = 1.0
+    primary_growth_pct: float = 2.0
+    secondary_growth_pct: float = 4.0
+    tertiary_growth_pct: float = 6.0
+    coincidence_factor: float = 0.92
+    dual_carbon_factor_pct: float = -0.8
+    electrification_factor_pct: float = 1.5
+
+
+@dataclass(frozen=True)
+class AnnualLoadForecastYear:
+    year: int
+    energy_gwh: float
+    max_load_mw: float
+    p10_energy_gwh: float
+    p90_energy_gwh: float
+    p10_max_load_mw: float
+    p90_max_load_mw: float
+    load_factor: float
+
+
+@dataclass(frozen=True)
+class SeasonalLoadShape:
+    season: str
+    values_mw: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class AnnualLoadForecastResult:
+    region: str
+    source: str
+    climate_block: str
+    algorithm: str
+    base_year: int
+    base_max_load_mw: float
+    years: tuple[AnnualLoadForecastYear, ...]
+    seasonal_shapes: tuple[SeasonalLoadShape, ...]
+    notes: tuple[str, ...]
+
+
+def load_annual_load_sample(path: str | Path | None = None) -> dict[str, object]:
+    """Load the built-in annual planning sample dataset."""
+    target = Path(path) if path is not None else ANNUAL_LOAD_SAMPLE_PATH
+    return json.loads(target.read_text(encoding="utf-8"))
+
+
+def _annual_history_from_dataset(dataset: dict[str, object]) -> list[AnnualLoadHistoryPoint]:
+    rows: list[AnnualLoadHistoryPoint] = []
+    for raw in dataset.get("history", []):
+        if not isinstance(raw, dict):
+            continue
+        rows.append(AnnualLoadHistoryPoint(
+            year=int(raw["year"]),
+            energy_gwh=float(raw["energy_gwh"]),
+            max_load_mw=float(raw["max_load_mw"]),
+            gdp_billion=float(raw.get("gdp_billion", 0.0)),
+            population_million=float(raw.get("population_million", 0.0)),
+            primary_gdp_billion=float(raw.get("primary_gdp_billion", 0.0)),
+            secondary_gdp_billion=float(raw.get("secondary_gdp_billion", 0.0)),
+            tertiary_gdp_billion=float(raw.get("tertiary_gdp_billion", 0.0)),
+        ))
+    rows.sort(key=lambda p: p.year)
+    return rows
+
+
+def _cagr(first: float, last: float, periods: int) -> float:
+    if first <= 0 or last <= 0 or periods <= 0:
+        return 0.0
+    return (last / first) ** (1.0 / periods) - 1.0
+
+
+def _linear_forecast(years: np.ndarray, values: np.ndarray, future_years: np.ndarray) -> np.ndarray:
+    if len(values) < 2:
+        return np.full(len(future_years), float(values[-1]) if len(values) else 0.0)
+    coef = np.polyfit(years.astype(float), values.astype(float), 1)
+    predicted = np.polyval(coef, future_years.astype(float))
+    return np.maximum(predicted, values[-1] * 0.50)
+
+
+def forecast_annual_load(dataset: dict[str, object], config: AnnualLoadForecastConfig) -> AnnualLoadForecastResult:
+    """Forecast annual electricity use and coincident maximum load for grid planning."""
+    horizon = max(5, min(20, int(config.horizon_years)))
+    history = _annual_history_from_dataset(dataset)
+    if len(history) < 2:
+        raise ValueError("年度负荷预测至少需要两年历史电量与最大负荷数据。")
+
+    base = history[-1]
+    hist_years = np.asarray([p.year for p in history], dtype=float)
+    hist_energy = np.asarray([p.energy_gwh for p in history], dtype=float)
+    hist_peak = np.asarray([p.max_load_mw for p in history], dtype=float)
+    future_years = np.arange(base.year + 1, base.year + horizon + 1, dtype=int)
+
+    # 1) 趋势外推法：历史线性趋势与 CAGR 折中，避免单一年份波动支配长期结果。
+    trend_linear = _linear_forecast(hist_years, hist_energy, future_years.astype(float))
+    energy_cagr = _cagr(hist_energy[0], hist_energy[-1], len(hist_energy) - 1)
+    trend_cagr = np.asarray([base.energy_gwh * (1.0 + energy_cagr) ** i for i in range(1, horizon + 1)], dtype=float)
+    trend_energy = 0.55 * trend_cagr + 0.45 * trend_linear
+
+    # 2) 弹性系数法：由历史电量/GDP 弹性估计，并允许分产业、人口输入修正。
+    gdp_cagr = _cagr(history[0].gdp_billion, base.gdp_billion, len(history) - 1)
+    elasticity = (energy_cagr / gdp_cagr) if gdp_cagr > 1e-6 else 0.85
+    elasticity = float(min(1.35, max(0.45, elasticity)))
+    sector_mix_growth = (
+        0.08 * config.primary_growth_pct + 0.58 * config.secondary_growth_pct + 0.34 * config.tertiary_growth_pct
+    ) / 100.0
+    macro_growth = 0.65 * config.gdp_growth_pct / 100.0 + 0.20 * sector_mix_growth + 0.15 * config.population_growth_pct / 100.0
+    policy_growth = (config.dual_carbon_factor_pct + config.electrification_factor_pct) / 100.0
+    elasticity_growth = max(-0.02, elasticity * macro_growth + policy_growth)
+    elasticity_energy = np.asarray([base.energy_gwh * (1.0 + elasticity_growth) ** i for i in range(1, horizon + 1)], dtype=float)
+
+    # 3) 综合法：长期规划推荐，以趋势稳态、宏观弹性、政策修正加权。
+    algorithm = config.algorithm.strip() or "综合法"
+    if "趋势" in algorithm:
+        energy = trend_energy
+        method_note = "趋势外推法：历史 CAGR 与线性趋势折中。"
+    elif "弹性" in algorithm:
+        energy = elasticity_energy
+        method_note = "弹性系数法：GDP/人口/分产业增长与历史电量弹性联动。"
+    else:
+        energy = 0.45 * trend_energy + 0.55 * elasticity_energy
+        method_note = "综合法：趋势外推、弹性系数、双碳与再电气化政策修正加权。"
+
+    peak_cagr = _cagr(hist_peak[0], hist_peak[-1], len(hist_peak) - 1)
+    avg_load_base = base.energy_gwh * 1000.0 / 8760.0
+    load_factor_base = avg_load_base / max(base.max_load_mw, 1e-6)
+    climate = config.climate_block or str(dataset.get("climate_block") or classify_climate_block(config.latitude, config.longitude, NANJING_ALTITUDE_M))
+    hot_summer = any(token in climate for token in ("夏热", "华东", "华南", "湿润", "亚热带"))
+    climate_peak_adder = 0.010 if hot_summer else 0.004
+    peak_growth = 0.58 * peak_cagr + 0.42 * elasticity_growth + climate_peak_adder
+    peak_growth += max(0.0, 0.96 - config.coincidence_factor) * 0.010
+
+    years: list[AnnualLoadForecastYear] = []
+    for idx, (yr, e) in enumerate(zip(future_years, energy), start=1):
+        lf = min(0.72, max(0.45, load_factor_base - 0.0025 * idx + 0.001 * (config.dual_carbon_factor_pct < 0)))
+        peak_from_energy = e * 1000.0 / (8760.0 * lf)
+        peak_from_growth = base.max_load_mw * (1.0 + peak_growth) ** idx
+        peak = (0.62 * peak_from_energy + 0.38 * peak_from_growth) * max(0.70, min(1.05, config.coincidence_factor / 0.92))
+        spread = 0.055 + 0.006 * idx
+        years.append(AnnualLoadForecastYear(
+            year=int(yr),
+            energy_gwh=float(e),
+            max_load_mw=float(peak),
+            p10_energy_gwh=float(e * (1.0 - spread)),
+            p90_energy_gwh=float(e * (1.0 + spread)),
+            p10_max_load_mw=float(peak * (1.0 - spread * 1.1)),
+            p90_max_load_mw=float(peak * (1.0 + spread * 1.1)),
+            load_factor=float(lf),
+        ))
+
+    final_peak = years[-1].max_load_mw
+    season_profiles = {
+        "春季": [0.62,0.58,0.55,0.54,0.56,0.62,0.72,0.80,0.84,0.83,0.80,0.79,0.78,0.79,0.82,0.86,0.90,0.94,0.96,0.92,0.84,0.76,0.70,0.65],
+        "夏季": [0.70,0.66,0.63,0.62,0.64,0.70,0.80,0.88,0.92,0.94,0.96,0.98,0.97,0.96,0.98,1.00,0.99,0.98,0.97,0.94,0.88,0.82,0.78,0.73],
+        "秋季": [0.60,0.56,0.54,0.53,0.55,0.61,0.71,0.79,0.83,0.82,0.79,0.78,0.77,0.78,0.81,0.85,0.89,0.92,0.93,0.89,0.82,0.74,0.68,0.63],
+        "冬季": [0.68,0.64,0.61,0.60,0.62,0.70,0.82,0.90,0.93,0.92,0.88,0.84,0.82,0.83,0.86,0.90,0.95,0.98,0.99,0.94,0.87,0.80,0.75,0.71],
+    }
+    if not hot_summer:
+        season_profiles["冬季"], season_profiles["夏季"] = season_profiles["夏季"], season_profiles["冬季"]
+    shapes = tuple(SeasonalLoadShape(season, tuple(final_peak * v for v in profile)) for season, profile in season_profiles.items())
+    notes = (
+        f"样例来源：{dataset.get('source', '内置数据集')}；本功能面向规划，不包含空间负荷预测。",
+        method_note,
+        "输入考虑历史负荷、经纬度/气候板块、GDP/人口及分产业增长、负荷同时率、双碳目标与再电气化政策。",
+        "P10/P90 为规划不确定性带，年限越远区间越宽；结果宜结合用户报装、产业项目清单和地方能源规划校核。",
+    )
+    return AnnualLoadForecastResult(
+        region=str(dataset.get("region", "规划区域")),
+        source=str(dataset.get("source", "内置年度负荷规划样例")),
+        climate_block=climate,
+        algorithm=algorithm,
+        base_year=base.year,
+        base_max_load_mw=base.max_load_mw,
+        years=tuple(years),
+        seasonal_shapes=shapes,
+        notes=notes,
+    )
+
+
+def annual_seasonal_shapes_for_year(result: AnnualLoadForecastResult, year: int | float) -> tuple[SeasonalLoadShape, ...]:
+    """Return seasonal 24-hour shapes scaled to a selected planning year."""
+    if not result.seasonal_shapes:
+        return ()
+    selected_year = int(round(float(year)))
+    year_axis = [result.base_year, *[row.year for row in result.years]]
+    peak_axis = [result.base_max_load_mw, *[row.max_load_mw for row in result.years]]
+    if not year_axis or not peak_axis:
+        return result.seasonal_shapes
+    selected_year = max(min(selected_year, max(year_axis)), min(year_axis))
+    selected_peak = float(np.interp(selected_year, year_axis, peak_axis))
+    final_peak = max(float(result.years[-1].max_load_mw if result.years else peak_axis[-1]), 1e-9)
+    scale = selected_peak / final_peak
+    return tuple(SeasonalLoadShape(shape.season, tuple(float(v) * scale for v in shape.values_mw)) for shape in result.seasonal_shapes)
+
+
+def annual_load_forecast_to_dict(result: AnnualLoadForecastResult) -> dict[str, object]:
+    years_for_shapes = [result.base_year, *[row.year for row in result.years]]
+    return {
+        "region": result.region,
+        "source": result.source,
+        "climate_block": result.climate_block,
+        "algorithm": result.algorithm,
+        "base_year": result.base_year,
+        "base_max_load_mw": result.base_max_load_mw,
+        "years": [
+            {
+                "year": row.year,
+                "energy_gwh": row.energy_gwh,
+                "max_load_mw": row.max_load_mw,
+                "p10_energy_gwh": row.p10_energy_gwh,
+                "p90_energy_gwh": row.p90_energy_gwh,
+                "p10_max_load_mw": row.p10_max_load_mw,
+                "p90_max_load_mw": row.p90_max_load_mw,
+                "load_factor": row.load_factor,
+            }
+            for row in result.years
+        ],
+        "seasonal_shapes_by_year": [
+            {
+                "year": year,
+                "shapes": [
+                    {
+                        "season": shape.season,
+                        "values_mw": list(shape.values_mw),
+                    }
+                    for shape in annual_seasonal_shapes_for_year(result, year)
+                ],
+            }
+            for year in years_for_shapes
+        ],
+        "notes": list(result.notes),
+    }
+
+
+def export_annual_load_forecast_json(result: AnnualLoadForecastResult, path: str | Path) -> Path:
+    target = Path(path)
+    target.write_text(json.dumps(annual_load_forecast_to_dict(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+
+def export_annual_load_forecast_csv(result: AnnualLoadForecastResult, path: str | Path) -> Path:
+    target = Path(path)
+    with target.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["section", "annual_years"])
+        writer.writerow(["region", result.region])
+        writer.writerow(["source", result.source])
+        writer.writerow(["climate_block", result.climate_block])
+        writer.writerow(["algorithm", result.algorithm])
+        writer.writerow(["base_year", result.base_year])
+        writer.writerow(["base_max_load_mw", f"{result.base_max_load_mw:.6g}"])
+        writer.writerow([])
+        writer.writerow(["year", "energy_gwh", "p10_energy_gwh", "p90_energy_gwh", "max_load_mw", "p10_max_load_mw", "p90_max_load_mw", "load_factor"])
+        for row in result.years:
+            writer.writerow([row.year, f"{row.energy_gwh:.6g}", f"{row.p10_energy_gwh:.6g}", f"{row.p90_energy_gwh:.6g}", f"{row.max_load_mw:.6g}", f"{row.p10_max_load_mw:.6g}", f"{row.p90_max_load_mw:.6g}", f"{row.load_factor:.6g}"])
+        writer.writerow([])
+        writer.writerow(["section", "seasonal_shapes_by_year"])
+        writer.writerow(["year", "season", "hour", "value_mw"])
+        for year in [result.base_year, *[row.year for row in result.years]]:
+            for shape in annual_seasonal_shapes_for_year(result, year):
+                for hour, value in enumerate(shape.values_mw):
+                    writer.writerow([year, shape.season, hour, f"{value:.6g}"])
+        writer.writerow([])
+        writer.writerow(["section", "notes"])
+        for note in result.notes:
+            writer.writerow([note])
+    return target
+
+
+def format_annual_load_forecast_summary(result: AnnualLoadForecastResult) -> str:
+    lines = [
+        "══ 年度负荷预测（规划用） ═════════════════════",
+        f"区域：{result.region}",
+        f"气候板块：{result.climate_block}",
+        f"基准年：{result.base_year}；方法：{result.algorithm}",
+        "",
+        "年份      电量/GWh       P10-P90/GWh       最大负荷/MW       P10-P90/MW     负荷率",
+    ]
+    for row in result.years:
+        lines.append(
+            f"{row.year:<6d} {row.energy_gwh:10.1f}  {row.p10_energy_gwh:8.1f}-{row.p90_energy_gwh:<8.1f}"
+            f" {row.max_load_mw:12.1f}  {row.p10_max_load_mw:8.1f}-{row.p90_max_load_mw:<8.1f} {row.load_factor:7.3f}"
+        )
+    lines.extend(["", "典型负荷形态：右侧曲线展示最终规划年春/夏/秋/冬 24 小时典型日形态。", "", "说明："])
+    lines.extend([f"- {note}" for note in result.notes])
+    return "\n".join(lines)

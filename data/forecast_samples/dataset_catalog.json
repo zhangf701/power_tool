@@ -54,5 +54,19 @@
     "schema_reference": "Electrician Cup load-forecasting public/third-party schema references",
     "reference_url": "https://blog.csdn.net/qq_29918313/article/details/105653955",
     "sample_file": "electrician_cup_load_sample.csv"
+  },
+  {
+    "name": "FUTURE_WEATHER_FORECAST_SAMPLE",
+    "kind": "future_weather",
+    "schema_reference": "Weather-only day-ahead forecast import schema for PowerTool GUI",
+    "reference_url": "local sample",
+    "sample_file": "future_weather_forecast_sample.csv"
+  },
+  {
+    "name": "OPEN_METEO_NANJING_FUTURE_WEATHER_SAMPLE",
+    "kind": "future_weather",
+    "schema_reference": "Open-Meteo Forecast API hourly CSV fields mapped to PowerTool future-weather import schema",
+    "reference_url": "https://open-meteo.com/en/docs",
+    "sample_file": "future_weather_open_meteo_nanjing_sample.csv"
   }
 ]

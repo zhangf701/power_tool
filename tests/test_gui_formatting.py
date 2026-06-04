@@ -12,6 +12,12 @@ if str(ROOT) not in sys.path:
 
 
 from power_tool_gui import ApproximationToolGUI, _detect_key_conclusion_lines, _manual_filename, _notebook_style_spec
+from power_tool_gui_common import CommonGuiMixin
+from power_tool_gui_comtrade import ComtradeGuiMixin
+from power_tool_gui_dynamics import DynamicsGuiMixin
+from power_tool_gui_forecast import ForecastGuiMixin
+from power_tool_gui_loop import LoopClosureGuiMixin
+from power_tool_gui_network_params import NetworkAndParameterGuiMixin
 
 
 def test_key_conclusion_line_detection() -> None:
@@ -31,6 +37,44 @@ def test_notebook_style_spec_uses_same_padding_for_selected_and_unselected() -> 
     assert padding_map["selected"] == (16, 8)
     assert padding_map["!selected"] == (16, 8)
     assert background_map["selected"] == "#173f7a"
+
+
+def test_gui_entrypoint_is_composed_from_focused_mixins() -> None:
+    import inspect
+
+    mro = ApproximationToolGUI.__mro__
+    assert CommonGuiMixin in mro
+    assert DynamicsGuiMixin in mro
+    assert NetworkAndParameterGuiMixin in mro
+    assert LoopClosureGuiMixin in mro
+    assert ForecastGuiMixin in mro
+    assert ComtradeGuiMixin in mro
+    assert len((ROOT / "power_tool_gui.py").read_text(encoding="utf-8").splitlines()) < 250
+
+    source = inspect.getsource(ApproximationToolGUI._build_day_ahead_forecast_tab)
+    run_source = inspect.getsource(ApproximationToolGUI._run_day_ahead_forecast)
+    assert "导入未来天气CSV" in source
+    assert "future_weather_path_var" in source
+    assert "load_future_weather_csv" in run_source
+
+
+def test_stateless_gui_helpers_are_static_methods_for_instance_calls() -> None:
+    import inspect
+
+    for name in (
+        "_add_entry",
+        "_set_text",
+        "_set_enabled",
+        "_slice_time_window",
+        "_estimate_nonperiodic_components",
+        "_sc_entry_matches_auto",
+        "_set_entry_text",
+        "_draw_vertical_dimension",
+        "_draw_dimension_line",
+        "_replace_entry",
+    ):
+        descriptor = inspect.getattr_static(ApproximationToolGUI, name)
+        assert isinstance(descriptor, staticmethod), name
 
 
 class _FakeEntry:
@@ -120,6 +164,29 @@ class _SummaryDummy:
         self.sag_driver_var = _FakeVar("temperature")
         self.sag_temp_scale_var = _FakeVar("60")
         self.sag_current_scale_var = _FakeVar("500")
+        self._forecast_widgets = {
+            "load": {
+                "dataset_var": _FakeVar("CAISO_LOAD_SAMPLE"),
+                "future_weather_path_var": _FakeVar("future_weather.csv"),
+                "date_var": _FakeVar("2025-06-22"),
+                "lat_entry": _FakeEntry("32.06"),
+                "lon_entry": _FakeEntry("118.80"),
+                "alt_entry": _FakeEntry("20"),
+                "holiday_var": _FakeVar("CN"),
+            },
+            "renewable": {
+                "dataset_var": _FakeVar("CAISO_RENEWABLE_SAMPLE"),
+                "future_weather_path_var": _FakeVar("weather.csv"),
+                "date_var": _FakeVar("2025-06-22"),
+                "lat_entry": _FakeEntry("32.06"),
+                "lon_entry": _FakeEntry("118.80"),
+                "alt_entry": _FakeEntry("20"),
+                "capacity_entry": _FakeEntry("500"),
+                "holiday_var": _FakeVar("CN"),
+                "resource_var": _FakeVar("solar"),
+            },
+        }
+        self._annual_forecast_widgets = {}
 
     def _current_tab_name(self) -> str:
         return self.current_tab
@@ -141,6 +208,14 @@ def test_tab_numeric_summary_covers_every_main_tab_and_param_subtab() -> None:
         dummy.current_tab = tab_name
         summary = ApproximationToolGUI._tab_numeric_summary(dummy)
         assert expected in summary
+
+    dummy.current_tab = "日前负荷预测"
+    load_summary = ApproximationToolGUI._tab_numeric_summary(dummy)
+    assert "未来天气CSV: future_weather.csv" in load_summary
+    dummy.current_tab = "新能源预测"
+    renewable_summary = ApproximationToolGUI._tab_numeric_summary(dummy)
+    assert "未来天气CSV: weather.csv" in renewable_summary
+    assert "新能源类型: solar" in renewable_summary
 
     dummy.current_tab = "电压无功分析"
     dummy._vr_notebook.current = "线路自然功率与无功"
@@ -243,3 +318,42 @@ def test_estimate_nonperiodic_components_returns_decay_parameters() -> None:
     assert 0.9 < dc_const < 1.7
     assert 2.0 < abs(dc_decay) < 3.0
     assert 0.02 < tau < 0.10
+
+
+def test_annual_forecast_trend_uses_two_stacked_year_axes() -> None:
+    import inspect
+
+    build_source = inspect.getsource(ApproximationToolGUI._build_annual_load_forecast_tab)
+    plot_source = inspect.getsource(ApproximationToolGUI._plot_annual_load_forecast)
+    assert "add_subplot(211)" in build_source
+    assert "add_subplot(212, sharex=ax_energy)" in build_source
+    assert ".twinx()" not in build_source
+    assert 'ax_energy.set_xlabel("Year")' in plot_source
+    assert 'ax_peak.set_xlabel("Year")' in plot_source
+
+
+def test_annual_shape_plot_uses_year_slider_and_draw_idle() -> None:
+    import inspect
+
+    build_source = inspect.getsource(ApproximationToolGUI._build_annual_load_forecast_tab)
+    plot_source = inspect.getsource(ApproximationToolGUI._plot_annual_load_forecast)
+    slider_source = inspect.getsource(ApproximationToolGUI._on_annual_shape_year_slider)
+    update_source = inspect.getsource(ApproximationToolGUI._update_annual_shape_plot)
+    assert "shape_year_slider" in build_source
+    assert "from_=base_year, to=final_year" in plot_source
+    assert "slider.set(base_year)" in plot_source
+    assert "annual_seasonal_shapes_for_year(result, selected_year)" in update_source
+    assert "line.set_ydata" in update_source
+    assert "draw_idle()" in update_source
+    assert "round(float(value))" in slider_source
+
+
+def test_documentation_lists_forecast_tabs_consistently() -> None:
+    readme_zh = (ROOT / "README_zh.md").read_text(encoding="utf-8")
+    readme_en = (ROOT / "README.md").read_text(encoding="utf-8")
+    overview_zh = (ROOT / "manuals" / "PowerTool_Overview_zh.md").read_text(encoding="utf-8")
+    assert "当前主标签页共 12 个" in readme_zh
+    for text in (readme_zh, overview_zh):
+        assert "日前" in text and "年度负荷预测" in text and "新能源预测" in text
+    assert "Day-ahead load forecasting" in readme_en
+    assert "Annual load forecasting" in readme_en

@@ -20,31 +20,36 @@
 
 ## 3. 当前功能总览
 
-当前主标签页共 10 个，另带一个固定在右侧的 `PowerTool AI` 问答侧栏：
+当前主标签页共 12 个，另带一个固定在右侧的 `PowerTool AI` 问答侧栏：
 
-1. 频率动态
-2. 机电振荡
-3. 静态电压稳定
-4. 线路自然功率与无功
+1. 录波曲线（COMTRADE）
+2. 频率动态
+3. 机电振荡
+4. 电压无功分析
 5. 暂稳评估
 6. 小扰动分析（SMIB）
 7. 配电网合环分析
 8. 参数校核与标幺值
 9. 短路电流计算
-10. 录波曲线（COMTRADE）
+10. 日前负荷预测
+11. 新能源预测
+12. 年度负荷预测
 
 `PowerTool AI` 侧栏不随主标签页和子标签页切换而移动，但软件界面中不再显示 AI 配置和标准提示词；相关内容统一写入 `power_tool_ai_config.json`。程序启动/提问时会读取该 JSON，在本地 `ollama` 与 API 模式间切换，默认使用本地 `qwen3.5:9b`。若使用 API 模式，配置文件中只保存环境变量名（例如 `DASHSCOPE_API_KEY`），程序会在运行时从环境变量读取密钥，从而避免把 key 明文写进配置文件。提问时程序会自动尝试截取当前软件界面，并把当前标签页算例数值摘要、标准系统提示词与用户问题一并发送给 AI。
 
 `PowerTool AI` 侧栏同时集成了手册浏览器。`manuals/` 目录下的手册文件已统一改为 APP 名命名：英文手册采用 `PowerTool_*.md`，中文手册采用 `PowerTool_*_zh.md`。点击侧栏中的“使用手册”按钮，会打开当前页面对应手册，并可在目录中切换到其他手册。
 
-其中，“参数校核与标幺值”内部又包含 4 个子页：“架空线路”“导线弧垂”“两绕组变压器”“三绕组变压器”；“小扰动分析（SMIB）”内部又包含 4 个子页：“工况与网络”“六阶机组”“AVR III”“PSS II”；“配电网合环分析”右侧绘图区还包含 2 个子页：“点位图与稳态电流”“冲击暂态电流”。
+其中，“参数校核与标幺值”内部又包含 4 个子页：“线路”“导线弧垂”“两绕组变压器”“三绕组变压器”；“小扰动分析（SMIB）”内部又包含 4 个子页：“工况与网络”“六阶机组”“AVR III”“PSS II”；“配电网合环分析”右侧绘图区还包含 2 个子页：“点位图与稳态电流”“冲击暂态电流”。
+
+“线路”参数页中的“线路参数计算”弹窗已扩展为“架空线参数计算”和“电缆参数计算”。电缆页默认不要求用户手动选择零序回流方式，而是按金属护层接地方式自动推断：未启用护层或单端接地时按大地回流；两端接地或交叉互联时按“护层+大地并联”的多导体矩阵与 Kron 消元近似，思路接近 PSCAD Line Constants Program 对电缆导体层/护层的处理。界面保留“高级：手动指定零序模型”，用于厂家参数复核、特殊接地网、ECC、铠装或管道回流等工况。若结果出现 X0 小于 X1，说明文字会提示这是护层/屏蔽层形成近距离零序回流时可能出现的结果，不应直接推广到所有电缆结构。
 
 从问题域划分看，本工具可以分为四层：
 
 - 近似解析层：频率动态、机电振荡、静态电压稳定、线路自然功率与无功。
 - 稳定性层：暂稳评估、小扰动分析（SMIB）。
-- 参数折算层：架空线路、导线弧垂、两绕组变压器、三绕组变压器、线路几何反算。
+- 参数折算层：线路、导线弧垂、两绕组变压器、三绕组变压器、线路几何反算。
 - 故障与操作层：短路电流计算、配电网合环分析。
+- 预测与规划层：日前负荷预测、新能源预测、年度负荷预测；日前负荷和新能源预测可额外导入未来天气预报 CSV，并把温度、GHI、风速、云量映射到预测网格。
 
 ---
 
@@ -54,16 +59,25 @@
 power_tool/
 ├── power_tool.py                    # 中文版入口；兼容导出层；运行 GUI 的主脚本
 ├── power_tool_en.py                 # 英文版 GUI 入口；兼容导出层
-├── power_tool_gui.py                # Tkinter GUI，仅负责界面、绘图、结果展示
+├── power_tool_gui.py                # Tkinter GUI 主壳、Notebook 装配和稳定入口
+├── power_tool_gui_common.py         # 通用 GUI mixin：样式、AI 侧栏、手册浏览、文本/图形助手
+├── power_tool_gui_dynamics.py       # 动态稳定类 GUI mixin：频率、振荡、暂稳、SMIB、AVC
+├── power_tool_gui_network_params.py # 参数/短路/几何/弧垂类 GUI mixin
+├── power_tool_gui_loop.py           # 配电网合环分析 GUI mixin
+├── power_tool_gui_forecast.py       # 日前负荷、新能源、太阳角度、年度负荷预测 GUI mixin
+├── power_tool_gui_comtrade.py       # 录波曲线 GUI mixin：COMTRADE 浏览、重导出、序量分析
+├── power_tool_forecast.py           # 日前/新能源/年度预测算法、CSV 读取和天气预报接入
 ├── power_tool_common.py             # 共享类型、输入校验、JSON 数据读取
 ├── power_tool_approximations.py     # 频率/机电振荡/静稳/自然功率等近似模型
 ├── power_tool_params.py             # 线路/变压器参数校核与标幺值折算
 ├── power_tool_sag.py                # 单档输电导线弧垂与简化热耦合分析
-├── power_tool_line_geometry.py      # 由导线几何数据反算序参数
+├── power_tool_line_geometry.py      # 由架空线/电缆几何数据反算序参数
 ├── power_tool_loop_closure.py       # 配电网合环近似分析内核
 ├── power_tool_faults.py             # 短路电流计算内核
 ├── power_tool_stability.py          # 冲击法、临界切除角、等面积法
 ├── power_tool_smib.py               # SMIB 小扰动分析内核
+├── power_tool_avc.py                # AVC 策略仿真内核
+├── power_tool_comtrade.py           # COMTRADE 解析与录波分析内核
 ├── line_params_reference.json       # 架空线路典型参数数据库
 ├── Approximate_Constants_and_Approximate_Formulas_in_Power_Systems.md    # 英文技术文章
 ├── Approximate_Constants_and_Approximate_Formulas_in_Power_Systems_zh.md # 中文技术文章
@@ -75,9 +89,9 @@ power_tool/
 
 `power_tool.py` 是中文版 GUI 的直接启动入口，直接执行 `python power_tool.py` 会启动中文界面。`power_tool_en.py` 是英文版 GUI 的直接启动入口，直接执行 `python power_tool_en.py` 会启动英文界面。两者都同时承担兼容导出层的角色，尽量兼顾旧脚本的导入方式。
 
-### 4.2 界面文件 `power_tool_gui.py`
+### 4.2 界面文件 `power_tool_gui.py` 与 GUI mixin
 
-该文件只处理 Tkinter 布局、Matplotlib 绘图、控件状态切换、文本结果组织和异常弹窗。工程上，这一层相当于“壳”，不再承担电力计算的核心逻辑。
+`power_tool_gui.py` 保留为主 GUI 壳，负责主窗口、Notebook 装配和对外稳定入口。通用界面能力迁入 `power_tool_gui_common.py`；频率动态、机电振荡、暂稳、SMIB 和 AVC 页面迁入 `power_tool_gui_dynamics.py`；线路参数、短路、导线几何和弧垂页面迁入 `power_tool_gui_network_params.py`；配电网合环页面迁入 `power_tool_gui_loop.py`；预测类页面迁入 `power_tool_gui_forecast.py`；录波曲线页面迁入 `power_tool_gui_comtrade.py`。工程上，GUI 层不承担电力计算核心逻辑；日前预测、未来天气 CSV 读取、算法集成和年度规划预测位于 `power_tool_forecast.py`。
 
 ### 4.3 公共基础 `power_tool_common.py`
 
@@ -106,6 +120,7 @@ power_tool/
 
 - `numpy`
 - `matplotlib`
+- `scikit-learn`（随 requirements 提供，用于可选树模型预测；仅在调用相关算法时延迟导入）
 - `tkinter`（通常由标准 Python 发行版提供）
 
 ### 5.3 安装示例
@@ -114,7 +129,7 @@ power_tool/
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
-python -m pip install numpy matplotlib
+python -m pip install -r requirements.txt
 ```
 
 ### 5.4 启动 GUI
@@ -749,7 +764,7 @@ PSS 图展示的是从转速偏差 `Δω` 到稳定器输出 `V_s` 的处理过�
 
 #### 7.8.4 “线路参数计算”弹窗
 
-这是“架空线路”子页中最复杂的辅助窗口。其作用是：由导线几何、土壤和地线数据反算正序和零序参数，然后回填到主页面或短路页面。
+这是“线路”子页中最复杂的辅助窗口。其作用是：由导线几何、土壤和地线数据反算正序和零序参数，然后回填到主页面或短路页面。
 
 ##### 左侧三大区块
 
@@ -993,9 +1008,9 @@ PSS 图展示的是从转速偏差 `Δω` 到稳定器输出 `V_s` 的处理过�
 | 暂稳评估-冲击法 | 计算 | 计算冲击法与临界切除近似 |
 | SMIB | 恢复 Kundur 默认值 | 恢复 Kundur 示例参数并重算 |
 | SMIB | 计算并绘图 | 求平衡点、线性化、特征值并作图 |
-| 架空线路 | 计算并校核 | 计算 π 型等值与标幺值 |
-| 架空线路 | 线路参数计算 | 打开几何反算弹窗 |
-| 架空线路 | 典型参数 | 打开典型参数数据库窗口 |
+| 线路 | 计算并校核 | 计算 π 型等值与标幺值 |
+| 线路 | 线路参数计算 | 打开几何反算弹窗 |
+| 线路 | 典型参数 | 打开典型参数数据库窗口 |
 | 线路参数计算弹窗 | 计算 | 根据几何数据计算序参数 |
 | 线路参数计算弹窗 | 回填正序到本页 | 回填 R1/X1/C1 到架空线路子页 |
 | 线路参数计算弹窗 | 回填序参数到短路页 | 回填 R1/X1/R0/X0 到短路页 |
@@ -1217,7 +1232,7 @@ from power_tool import smib_small_signal_analysis, kundur_smib_defaults
 
 推荐流程是：
 
-1. 在“架空线路”子页点击“线路参数计算”；
+1. 在“线路”子页点击“线路参数计算”；
 2. 在弹窗中录入导线几何、土壤和地线信息；
 3. 点击“计算”确认 `Z1/Z0/C1/C0`；
 4. 点击“回填正序到本页”，完成线路标幺值折算；
@@ -1281,3 +1296,8 @@ from power_tool import smib_small_signal_analysis, kundur_smib_defaults
 
 - 中文版：`Approximate_Constants_and_Approximate_Formulas_in_Power_Systems_zh.md`
 - 英文版：`Approximate_Constants_and_Approximate_Formulas_in_Power_Systems.md`
+
+预测类功能另补充“预测算法与基础数据格式”专题手册，集中说明日前负荷预测、新能源预测和年度负荷预测所需基础数据列、单位、时间格式、未来天气预报 CSV、缺失值处理、算法原理、物理后处理和工程使用边界：
+
+- 中文版：`manuals/PowerTool_Forecasting_Algorithms_and_Data_Format_zh.md`
+- 英文版：`manuals/PowerTool_Forecasting_Algorithms_and_Data_Format.md`

@@ -1,60 +1,40 @@
-# PowerTool Manual - Parameter Validation & Per-Unit: Overhead Line
+# PowerTool Manual - Parameter Validation & Per-Unit: Lines
 
 ## 1. Purpose
-This page converts named overhead-line parameters into per-unit values and checks whether the inputs lie in typical engineering ranges.
+This page converts named line parameters into per-unit values and checks whether the inputs lie in typical engineering ranges. The line-geometry calculator includes two calculation pages: overhead-line parameters and cable parameters.
 
-## 2. Suggested workflow
-1. Enter the system base values, line length, and the positive- and zero-sequence parameters.
-2. Run the calculation and review both the physical-unit summary and the per-unit summary.
-3. If needed, open the line-geometry calculator to back-calculate sequence parameters from conductor geometry.
+## 2. Suggested Workflow
+1. Enter the system base values, line length, and positive-/zero-sequence parameters.
+2. Run the calculation and review the physical-unit summary and per-unit summary.
+3. If parameters need to be derived from geometry, open **Line Parameter Calculation** and choose either **Overhead Line Parameter Calculation** or **Cable Parameter Calculation**.
+4. For cable studies, enter conductor, insulation, burial, sheath/screen, and sheath-bonding data, then review the reported zero-sequence return model.
 
-## 3. What to check carefully
+## 3. Cable Zero-Sequence Return Logic
+The cable page follows an automatic engineering rule by default:
+
+- No metallic sheath/screen, or single-point bonding: use earth return.
+- Both-end bonding: use sheath-plus-earth return with multi-conductor matrix reduction.
+- Cross-bonding: use the same sheath-plus-earth Kron-reduction approximation, with a note that steady-state sheath circulating losses are reduced by cross-bonding.
+
+This is closer to PSCAD line-constants practice than a fixed `X0/X1` rule: the program first builds a simplified multi-conductor system for the three cores and three metallic sheaths, then eliminates the sheath conductors with Kron reduction. The advanced override can force earth return, sheath-only coaxial lower-bound return, or sheath-plus-earth return when checking special cases.
+
+## 4. Interpreting `X0 < X1`
+`X0 < X1` is not assumed for all cables. It can appear when a bonded metallic sheath or screen provides a close zero-sequence return path and partially cancels the external magnetic field. If the sheath is single-point bonded, absent, poorly bonded, or if the relevant return path is mainly earth/grid/ECC, `X0` can become much larger than `X1`.
+
+Use manufacturer sequence-impedance data, measured values, or a formal line-constants tool for relay settings, commissioning decisions, or unusual cable structures such as pipe-type cables, three-core armored cables, long cross-bonded sections, or routes with strong adjacent metallic return paths.
+
+## 5. What to Check Carefully
 - Base voltage and base capacity must match the intended study base.
 - Sequence resistance, reactance, and capacitance should use consistent units.
-- Pay attention to the warning block if a parameter is outside typical reference ranges.
+- Cable sheath resistance and radius strongly affect zero-sequence results.
+- The result note block states whether the zero-sequence model was inferred automatically or forced by the advanced override.
+- Treat three-core common-sheath/armored cables as a separate structure rather than directly reusing the single-core sheath model.
 
-## 4. Common mistakes
+## 6. Common Mistakes
 - Confusing Ω/km with total Ω.
 - Mixing microfarads and farads.
-- Forgetting to convert the voltage base to the line-to-line RMS convention used by the page.
+- Assuming overhead-line intuition (`X0 >> X1`) always applies to bonded single-core cables.
+- Treating a sheath-only lower-bound result as a final protection-study value.
 
-## 5. Engineering advice
-Use this page as a front-end data-quality filter before the parameters are fed into fault, stability, or load-flow studies.
-
-## Appendix A: Input checklist
-- Confirm that the voltage base, capacity base, and unit system are consistent.
-- Check the dimensions of all key quantities before interpreting the result.
-- Record the source of critical equipment data, such as nameplate values, test reports, or dispatch ledgers.
-- Compare at least three representative operating conditions whenever the conclusion may affect operation.
-
-## Appendix B: Turning results into action
-1. Use the page result as a first-pass engineering screening tool.
-2. For feasible options, prepare at least three boundary-condition check cases.
-3. Review the key conclusions jointly with operation, protection, and maintenance staff when relevant.
-4. Convert the result into an action sheet with trigger conditions, execution steps, rollback conditions, and alarm thresholds.
-
-## Appendix C: FAQ
-- **Why can the page result differ from field records?**  
-  This software is an engineering approximation tool. It does not model every topology detail, controller dead band, or protection logic.
-- **How can I improve confidence in the result?**  
-  Improve input quality first, then compare multiple operating conditions and verify that the conclusion is stable.
-- **When must I switch to a formal simulation platform?**  
-  Move to formal simulation when the decision affects relay settings, plant commissioning, major operating-mode changes, or a narrow security margin.
-
-## Appendix D: Suggested case-record template
-| Item | Suggested content |
-|---|---|
-| Case name | For example, summer evening peak load or N-1 transformer mode |
-| Key inputs | Voltage, power flow, equipment capacity, equivalent parameters |
-| Page conclusion | Stability assessment, operating-zone assessment, or risk level |
-| Suggested action | Tap change, compensation switching, operating-mode adjustment |
-| Follow-up conclusion | Whether formal load-flow, transient-stability, or EMT studies are required |
-
-## Appendix E: Delivery notes
-- When exporting to operators, include the applicability limits and the prohibited conditions.
-- When exporting to commissioning or test staff, include the parameter-source table and the software version.
-- When exporting to managers, include the risk level, the implementation cost, and the recommended next step.
-- Keep screenshots and text results after each use for later review.
-
-## Appendix F: Post-review notes
-After each analysis, record at least the input version, operating mode, key judgment, action taken, and field feedback. Over time these records become a local experience base that improves consistency and speed.
+## 7. Engineering Advice
+Use this page as a front-end data-quality filter before parameters are fed into fault, stability, or load-flow studies. Cable results are engineering approximations and should be checked against manufacturer data, measured records, PSCAD/EMTP/OpenDSS-style matrix data, or other formal line-constants tools before commissioning decisions.
